@@ -798,6 +798,9 @@ whole repeat. An unknown day list returns 400.
 `time` is required and must be `HH:MM` on a 24-hour clock (no seconds and no
 am/pm). It rings at the next occurrence of that time in the device time zone:
 if the time has passed today it is tomorrow, so an alarm is never in the past.
+A pending alarm keeps its local time when the device time zone changes (see
+`PUT /api/v1/system/timezone`): it is rescheduled to the same `HH:MM` in the new
+zone, except while it is snoozed.
 `label` is optional, with the same rules as timer labels. Success returns HTTP
 201 with `{ "id", "time", "days", "due_epoch" }`. A malformed body or time returns 400.
 An unset clock (no network time yet), a full schedule, or a time-of-day that
@@ -2211,10 +2214,13 @@ then: the current zone stays in use until HA reports one. While HA is the
 source, the zone in `web-config.json` is authoritative and is never
 overwritten by the web daemon's copy.
 
-The daemons that render local time (LED night mode, the assistant's clock, the
-live-session time tool) follow the stored zone within seconds, so the
-response reports `"applies": "now"`; every other daemon gets it as `TZ` at the
-next boot. Anything that is not a plausible TZ string, name or source is
+The daemons that render local time or schedule by it (LED night mode, the
+assistant's clock, the live-session time tool, and `timerd`) follow the stored
+zone within about ten seconds, so the response reports `"applies": "now"`.
+When `timerd` sees a new zone it moves every pending alarm and reminder to the
+same local time of day in the new zone (a 09:00 alarm stays a 09:00 alarm);
+countdown timers, a ringing alarm and a snoozed alarm are not moved. Every
+other daemon gets the zone as `TZ` at the next boot. Anything that is not a plausible TZ string, name or source is
 rejected with 400 rather than written.
 
 #### GET /api/v1/system/features

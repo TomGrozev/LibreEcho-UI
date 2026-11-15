@@ -88,6 +88,14 @@ struct le_timer {
        due time timerd says the label and does not enter the ringing state.
        Reminders always keep hour and minute, repeating or not. */
     int reminder;
+    /* A one-off alarm set from a local time of day ("09:00") also keeps hour
+       and minute, so le_timer_rezone() can move it when the zone changes.
+       Set only for such alarms; repeating alarms and reminders always have
+       hour and minute and do not need it. */
+    int local_time;
+    /* Set when a snooze moved the due instant. A snooze is five minutes from
+       a moment, not a wall-clock time, so it must survive a zone change. */
+    int snoozed;
     char label[LE_TIMER_LABEL_MAX];
 };
 
@@ -112,7 +120,9 @@ int le_timer_add_countdown(struct le_timer_set *set, long long seconds,
 /*
  * Add an alarm at a wall-clock instant. Refused when the clock is not yet
  * credible, or when the instant is in the past: both would fire immediately,
- * which is never what was asked for.
+ * which is never what was asked for. An instant on a whole local minute is
+ * assumed to come from "HH:MM" (le_timer_next_alarm_epoch) and its local time
+ * of day is kept for le_timer_rezone().
  */
 int le_timer_add_alarm(struct le_timer_set *set, long long due_epoch,
                        const char *label, long long now_epoch,
@@ -189,6 +199,16 @@ int le_timer_restore_alarm_with_id(struct le_timer_set *set,
                                    const char *label, long long now_epoch,
                                    long long now_monotonic_ms,
                                    unsigned int *id);
+
+/*
+ * The device time zone changed (TZ is already updated). Recompute the due time
+ * of every pending alarm and reminder that is defined by a local time of day,
+ * keeping hour, minute and repeat days. Countdowns (monotonic), anything
+ * ringing, snoozed alarms and one-off alarms without a recorded local time are
+ * left alone. Returns how many due times changed; 0 while the clock is not
+ * credible.
+ */
+int le_timer_rezone(struct le_timer_set *set, long long now_epoch);
 
 int le_timer_cancel(struct le_timer_set *set, unsigned int id);
 int le_timer_cancel_at(struct le_timer_set *set, unsigned int id,
