@@ -3341,7 +3341,8 @@ static int status_json(const struct daemon_context *ctx, char *out,
         "\"sunrise\":{\"active\":%s,\"progress_percent\":%u},"
         "\"output\":{\"effective_brightness\":%u,\"frame_load\":%u,"
         "\"max_load\":%u,\"limited\":%s,\"slew_limited\":%s},"
-        "\"music\":{\"active\":%s,\"grammar\":\"%s\",\"effect\":\"%s\","
+        "\"music\":{\"active\":%s,\"grammar\":\"%s\",\"mood\":\"%s\","
+        "\"effect\":\"%s\","
         "\"session\":%u},"
         "\"boot_profile\":{\"r\":%u,\"g\":%u,\"b\":%u,\"brightness\":%u},"
         "\"profiles\":{",
@@ -3382,6 +3383,8 @@ static int status_json(const struct daemon_context *ctx, char *out,
         ctx->output_diag.slew_limited ? "true" : "false",
         ctx->music_active ? "true" : "false",
         ctx->music_active ? le_music_grammar_name(ctx->music_director.grammar)
+                          : "none",
+        ctx->music_active ? le_music_mood_name(ctx->music_director.mood)
                           : "none",
         ctx->music_active ? le_music_effect_name(ctx->music_director.effect)
                           : "none",

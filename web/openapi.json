@@ -3102,7 +3102,7 @@
      "LED and buttons"
     ],
     "summary": "Read LED state",
-    "description": "Returns available LED state. On images without ledd, the 200 response contains data.available=false and data.unavailable=true. The data object also carries idle_mode and the sleep_light, output (effective_brightness/frame_load/max_load/limited/slew_limited) and music (active/grammar/effect/session) objects, matching ledd status exactly.",
+    "description": "Returns available LED state. On images without ledd, the 200 response contains data.available=false and data.unavailable=true. The data object also carries idle_mode and the sleep_light, output (effective_brightness/frame_load/max_load/limited/slew_limited) and music (active/grammar/mood/effect/session) objects, matching ledd status exactly.",
     "responses": {
      "200": {
       "$ref": "#/components/responses/Success"

@@ -3,9 +3,10 @@
  *
  * Turns a director scene plus the current feature frame into a logical
  * 12-pixel RGB frame.  Every grammar shares one interface so the director can
- * crossfade between them.  Rhythm controls motion, timbre controls colour,
- * dynamics control occupied area; the palette stays restrained and dark space
- * is preserved by starting from black each frame.
+ * crossfade between them.  The ring always turns, at the tempo when one is
+ * known; kicks, snares and hats punch brightness and size and shove the
+ * rotation.  The palette stays restrained and dark space is preserved: each
+ * grammar lights a few pixels and starts from black each frame.
  *
  * The output is a logical frame (brightness is applied later by led_output).
  * Near-white accents use the calibrated named warm/cool points from
@@ -18,22 +19,32 @@
 #include "led_output.h"
 
 struct le_music_render_state {
-    unsigned int peak[LE_LED_PIXELS];  /* classic mirror peak hold */
-    unsigned int free_phase;           /* free-running orbit position */
-    int have_phase;
-    /* Motion and onset envelope, advanced by the render clock so the ring
-       keeps moving and beats decay between producer frames. */
+    /* Motion and hit envelopes, advanced by the render clock so the ring
+       keeps moving and hits decay between producer frames. */
     unsigned int clock_ms;             /* last render clock */
     int have_clock;
     unsigned int last_seq;             /* last feature frame seen */
     unsigned int last_frame_ms;
-    unsigned int last_phase;           /* last frame beat_phase */
     int have_frame;
     unsigned int motion_q16;           /* ring position, 1 px == 65536 */
-    unsigned int onset_env;            /* bass hit envelope 0..255 */
-    unsigned int onset_floor;          /* slow onset_low baseline */
+    unsigned int chase_q16;            /* same, reversible (chase) */
+    int chase_reverse;
+    unsigned int since_reverse_ms;
+    unsigned int shove;                /* kick speed-up, x/256 */
+    unsigned int onset_env;            /* kick envelope 0..255 */
+    unsigned int snare_env;
+    unsigned int hat_env;
     unsigned int last_onset;           /* last frame onset_low */
+    unsigned int last_mid;
+    unsigned int last_high;
     unsigned int last_events;          /* last frame event flags */
+    unsigned int last_phase;           /* last frame beat phase */
+    unsigned int since_kick_ms;        /* time since the last kick or beat */
+    unsigned int bloom_origin;         /* pixel the kick ripple opens from */
+    unsigned int kick_ripple_ms;       /* ripple ages */
+    unsigned int kick_ripple_level;
+    unsigned int snare_ripple_ms;
+    unsigned int snare_ripple_level;
     unsigned int step_ms;              /* clock advance of this render */
 };
 

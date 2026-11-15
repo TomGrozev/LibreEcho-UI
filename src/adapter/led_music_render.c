@@ -4,23 +4,41 @@
 #include <string.h>
 
 /* Sub-pixel ring geometry: motion is kept in 1/65536 px, drawing in 1/256 px.
-   motion_q16 wraps at two revolutions so half-speed drift stays continuous. */
+   Positions wrap at two revolutions so half-speed layers stay continuous. */
 #define LE_PX_Q16            65536U
 #define LE_RING_Q16          ((unsigned int)LE_LED_PIXELS * LE_PX_Q16)
 #define LE_MOTION_WRAP       (2U * LE_RING_Q16)
 #define LE_RING8             ((unsigned int)LE_LED_PIXELS * 256U)
-/* Beat phase is trusted for motion only above this confidence (as orbit). */
-#define LE_BEAT_LOCK         110U
-/* Onset envelope: instant attack, linear release from full in this time. */
-#define LE_ONSET_RELEASE_MS  200U
-#define LE_ONSET_MARGIN      12U
-/* onset_low baseline time constant (frame-rate independent). */
-#define LE_ONSET_FLOOR_MS    700U
-/* Classic mirror peak release: 12 levels per 33 ms render tick. */
-#define LE_PEAK_FALL_PER_TICK  12U
-#define LE_PEAK_FALL_TICK_MS 33U
-/* Low-confidence orbit: one pixel per 180 ms of render clock. */
-#define LE_ORBIT_STEP_MS     180U
+/* Tempo is used for speed from this confidence; below it the ring free-runs. */
+#define LE_TEMPO_TRUST       64U
+/* Rotation: this many pixels per beat, with the tempo folded into one octave
+   so half/double-time estimates turn the ring at the same rate. */
+#define LE_PX_PER_BEAT       3U
+#define LE_BPM_FOLD_LOW      8000U
+#define LE_BPM_FOLD_HIGH     16000U
+/* Free-running speed in 1/65536 px per ms: 4.5 px/s plus up to 1.5 px/s with
+   loudness. */
+#define LE_FREE_SPEED        295U
+#define LE_FREE_SPEED_LOUD   98U
+/* A hit is a rise of this much to at least this level (onsets are published
+   normalised: the strongest recent hit is near 255). */
+#define LE_HIT_RISE          16U
+#define LE_HIT_LEVEL         40U
+/* A tracked beat with no kick of its own within this time still pulses. */
+#define LE_BEAT_FILL_MS      150U
+/* Hit envelopes: instant attack, linear release from full in this time. */
+#define LE_KICK_RELEASE_MS   240U
+#define LE_SNARE_RELEASE_MS  180U
+#define LE_HAT_RELEASE_MS    110U
+/* A kick also shoves the rotation: up to this much extra speed (x/256),
+   released linearly. */
+#define LE_SHOVE_MAX         640U
+#define LE_SHOVE_RELEASE_MS  260U
+/* Bloom ripples. */
+#define LE_RIPPLE_KICK_MS    460U
+#define LE_RIPPLE_SNARE_MS   320U
+/* The chase reverses on a snare, at most this often. */
+#define LE_REVERSE_MIN_MS    450U
 /* Longest clock step honoured at once (a stall must not jump the ring). */
 #define LE_MAX_STEP_MS       500U
 
@@ -87,28 +105,54 @@ void le_music_render_state_reset(struct le_music_render_state *state,
     if (state == NULL)
         return;
     memset(state, 0, sizeof(*state));
-    state->free_phase = session % LE_LED_PIXELS;
     state->motion_q16 = (session % LE_LED_PIXELS) * LE_PX_Q16;
+    state->chase_q16 = state->motion_q16;
+    state->bloom_origin = session % LE_LED_PIXELS;
+    state->kick_ripple_ms = LE_RIPPLE_KICK_MS;
+    state->snare_ripple_ms = LE_RIPPLE_SNARE_MS;
+}
+
+static unsigned int le_release(unsigned int value, unsigned int dt,
+                               unsigned int full, unsigned int release_ms)
+{
+    unsigned int fall = dt * full / release_ms;
+
+    return value > fall ? value - fall : 0U;
+}
+
+/* Strength of a new hit in one onset group, 0 when there is none: the
+   published onset rose clearly, or its event flag was just raised (the
+   producer latches event flags across several frames). */
+static unsigned int le_hit(unsigned int now, unsigned int last, int flag_rose)
+{
+    unsigned int strength = 0U;
+
+    /* Even a modest hit must read on the ring: 40 -> 120, 255 -> 255. */
+    if (now >= LE_HIT_LEVEL && now > last + LE_HIT_RISE)
+        strength = 96U + now * 159U / 255U;
+    if (flag_rose && strength < 180U)
+        strength = 180U;
+    return strength;
 }
 
 /*
- * Advance motion and the onset envelope to clock_ms.  Motion free-runs on the
- * render clock, faster with loudness/energy, unless the beat is locked: then
- * it advances exactly one pixel per beat (bpm, or the beat-phase delta when
- * no tempo is reported).  Everything is time-based, so the producer frame
- * rate (11.7 or 23.4 fps) does not change speeds.  The envelope kicks only on
- * a rising edge: onset_low rising above the previous frame and a slow
- * baseline, or a KICK flag that was clear in the previous frame (the producer
- * latches event flags across several frames).
+ * Advance motion and the hit envelopes to clock_ms.  Everything runs on the
+ * render clock, so the producer frame rate does not change speeds.
+ *
+ * The ring always turns: LE_PX_PER_BEAT pixels per beat once a tempo is
+ * trusted, a steady free-running speed otherwise.  Hits drive it: a kick
+ * punches the kick envelope (brightness and size in every grammar) and shoves
+ * the rotation forward, a snare and a hat punch their own envelopes.  A kick
+ * and a snare each start a bloom ripple, and a snare reverses the chase.
  */
 static void le_render_advance(struct le_music_render_state *s,
                               const struct le_music_features *f,
                               unsigned int clock_ms)
 {
     unsigned int dt = 0U;
-    unsigned int step = 0U;
-    unsigned int fall;
-    int locked = f->beat_confidence >= LE_BEAT_LOCK;
+    unsigned int speed;
+    unsigned int step;
+    int tempo = f->beat_confidence >= LE_TEMPO_TRUST && f->bpm_x100 >= 3000U;
     int new_frame = !s->have_frame || f->seq != s->last_seq ||
                     f->timestamp_ms != s->last_frame_ms;
 
@@ -123,245 +167,341 @@ static void le_render_advance(struct le_music_render_state *s,
         dt = LE_MAX_STEP_MS;
     s->step_ms = dt;
 
-    fall = dt * 255U / LE_ONSET_RELEASE_MS;
-    s->onset_env = s->onset_env > fall ? s->onset_env - fall : 0U;
-
-    if (locked && f->bpm_x100 >= 4000U) {
-        unsigned int bpm = f->bpm_x100 > 24000U ? 24000U : f->bpm_x100;
-        step = dt * (bpm * LE_PX_Q16 / 6000000U);   /* 1 px per beat */
-    } else if (locked) {
-        if (new_frame && s->have_frame) {
-            unsigned int delta = (f->beat_phase - s->last_phase) & 0xFFFFU;
-            if (delta < 0x8000U)                     /* ignore re-syncs */
-                step = delta;
-        }
-    } else {
-        /* ~0.6 px/s when quiet up to ~3 px/s when loud. */
-        step = dt * (40U + f->loudness_fast / 2U + f->energy / 8U);
-    }
-    s->motion_q16 = (s->motion_q16 + step) % LE_MOTION_WRAP;
+    s->onset_env = le_release(s->onset_env, dt, 255U, LE_KICK_RELEASE_MS);
+    s->snare_env = le_release(s->snare_env, dt, 255U, LE_SNARE_RELEASE_MS);
+    s->hat_env = le_release(s->hat_env, dt, 255U, LE_HAT_RELEASE_MS);
+    s->shove = le_release(s->shove, dt, LE_SHOVE_MAX, LE_SHOVE_RELEASE_MS);
+    s->kick_ripple_ms += dt;
+    if (s->kick_ripple_ms > LE_RIPPLE_KICK_MS)
+        s->kick_ripple_ms = LE_RIPPLE_KICK_MS;
+    s->snare_ripple_ms += dt;
+    if (s->snare_ripple_ms > LE_RIPPLE_SNARE_MS)
+        s->snare_ripple_ms = LE_RIPPLE_SNARE_MS;
+    s->since_reverse_ms += dt;
+    if (s->since_reverse_ms > LE_REVERSE_MIN_MS)
+        s->since_reverse_ms = LE_REVERSE_MIN_MS;
+    s->since_kick_ms += dt;
+    if (s->since_kick_ms > LE_MAX_STEP_MS)
+        s->since_kick_ms = LE_MAX_STEP_MS;
 
     if (new_frame) {
-        unsigned int kick = 0U;
-        unsigned int frame_dt;
+        unsigned int events = f->events;
+        unsigned int rose = s->have_frame ? events & ~s->last_events : 0U;
+        unsigned int kick;
+        unsigned int snare;
+        unsigned int hat;
+        unsigned int phase = f->beat_phase & 0xFFFFU;
+
         if (!s->have_frame) {
-            s->onset_floor = f->onset_low;
             s->last_onset = f->onset_low;
-            s->last_events = 0U;
+            s->last_mid = f->onset_mid;
+            s->last_high = f->onset_high;
+            s->last_phase = phase;
         }
-        frame_dt = s->have_frame ? f->timestamp_ms - s->last_frame_ms : 0U;
-        if (frame_dt > LE_ONSET_FLOOR_MS)
-            frame_dt = LE_ONSET_FLOOR_MS;
-        if (f->onset_low > s->last_onset + LE_ONSET_MARGIN &&
-            f->onset_low > s->onset_floor + LE_ONSET_MARGIN) {
-            kick = (f->onset_low - s->onset_floor) * 2U;
-            if (kick > 255U)
-                kick = 255U;
+        kick = le_hit(f->onset_low, s->last_onset,
+                      (rose & LE_MUSIC_EVENT_KICK) != 0U);
+        snare = le_hit(f->onset_mid, s->last_mid,
+                       (rose & LE_MUSIC_EVENT_SNARE) != 0U);
+        hat = le_hit(f->onset_high, s->last_high,
+                     (rose & LE_MUSIC_EVENT_HIGH) != 0U);
+        /* A tracked beat drives the ring even when its kick is buried in
+           the mix: the beat phase wrapped and no kick landed with it. */
+        if (kick == 0U && tempo && s->last_phase > phase &&
+            s->last_phase - phase > 0x8000U &&
+            s->since_kick_ms >= LE_BEAT_FILL_MS) {
+            kick = 120U + f->beat_strength / 3U;
+            if (kick > 200U)
+                kick = 200U;
         }
-        if ((f->events & LE_MUSIC_EVENT_KICK) &&
-            !(s->last_events & LE_MUSIC_EVENT_KICK) && f->onset_low > kick)
-            kick = f->onset_low;
-        if (kick > s->onset_env)
-            s->onset_env = kick;
-        if (f->onset_low >= s->onset_floor)
-            s->onset_floor += ((f->onset_low - s->onset_floor) * frame_dt +
-                               LE_ONSET_FLOOR_MS / 2U) / LE_ONSET_FLOOR_MS;
-        else
-            s->onset_floor -= ((s->onset_floor - f->onset_low) * frame_dt +
-                               LE_ONSET_FLOOR_MS / 2U) / LE_ONSET_FLOOR_MS;
+        if (kick > 0U) {
+            s->since_kick_ms = 0U;
+            if (kick > s->onset_env)
+                s->onset_env = kick;
+            if (kick * LE_SHOVE_MAX / 255U > s->shove)
+                s->shove = kick * LE_SHOVE_MAX / 255U;
+            /* Each bloom opens five pixels on from the last one. */
+            s->bloom_origin = (s->bloom_origin + 5U) % LE_LED_PIXELS;
+            s->kick_ripple_ms = 0U;
+            s->kick_ripple_level = kick;
+        }
+        if (snare > 0U) {
+            if (snare > s->snare_env)
+                s->snare_env = snare;
+            s->snare_ripple_ms = 0U;
+            s->snare_ripple_level = snare;
+            if (s->since_reverse_ms >= LE_REVERSE_MIN_MS) {
+                s->chase_reverse = !s->chase_reverse;
+                s->since_reverse_ms = 0U;
+            }
+        }
+        if (hat > s->hat_env)
+            s->hat_env = hat;
         s->last_onset = f->onset_low;
-        s->last_events = f->events;
+        s->last_mid = f->onset_mid;
+        s->last_high = f->onset_high;
+        s->last_events = events;
+        s->last_phase = phase;
         s->last_seq = f->seq;
         s->last_frame_ms = f->timestamp_ms;
-        s->last_phase = f->beat_phase & 0xFFFFU;
         s->have_frame = 1;
     }
+
+    if (tempo) {
+        unsigned int bpm = f->bpm_x100;
+
+        while (bpm < LE_BPM_FOLD_LOW)
+            bpm *= 2U;
+        while (bpm > LE_BPM_FOLD_HIGH)
+            bpm /= 2U;
+        /* px/beat * beats/ms, in 1/65536 px. */
+        speed = bpm * LE_PX_PER_BEAT * 64U / 5859U;
+    } else {
+        speed = LE_FREE_SPEED + f->loudness_fast * LE_FREE_SPEED_LOUD / 255U;
+    }
+    step = dt * (speed * (256U + s->shove) / 256U);
+    s->motion_q16 = (s->motion_q16 + step) % LE_MOTION_WRAP;
+    if (s->chase_reverse)
+        s->chase_q16 = (s->chase_q16 + LE_MOTION_WRAP -
+                        step % LE_MOTION_WRAP) % LE_MOTION_WRAP;
+    else
+        s->chase_q16 = (s->chase_q16 + step) % LE_MOTION_WRAP;
 }
 
 /* ------------------------------- grammars ------------------------------- */
 
+/* Resting brightness of a grammar's body; hits add on top of it.  Quiet
+   passages dim the whole look instead of leaving a bright idle ring. */
+static unsigned int le_body_level(const struct le_music_features *f)
+{
+    unsigned int level = 56U + f->loudness_fast / 4U;
+    unsigned int gate = f->loudness_fast * 6U;
+
+    return gate < 255U ? le_mul255(level, gate) : level;
+}
+
+static unsigned int le_punch(unsigned int body, unsigned int env)
+{
+    unsigned int level = body + env * (255U - body) / 255U;
+
+    return level > 255U ? 255U : level;
+}
+
+/* A soft dot: full within core, fading linearly to nothing at half (1/256
+   px). */
+static void le_dot(struct led_rgb out[LE_LED_PIXELS], unsigned int pos8,
+                   unsigned int half, struct led_rgb colour,
+                   unsigned int level)
+{
+    unsigned int core = half > 256U ? half - 256U : 0U;
+    unsigned int i;
+
+    for (i = 0U; i < LE_LED_PIXELS; i++) {
+        unsigned int d = le_distance8(i, pos8);
+
+        if (d >= half)
+            continue;
+        le_add(&out[i], colour,
+               d <= core ? level
+                         : le_mul255(level, (half - d) * 255U / (half - core)));
+    }
+}
+
+/* Comet: a bright head with a fading tail chasing round the ring.  A kick
+   whitens the head and stretches the tail, a snare fires a spark opposite. */
 static void le_render_ribbon(struct led_rgb out[LE_LED_PIXELS],
                              const struct le_music_features *f,
                              const struct le_music_render_state *state,
-                             struct led_rgb primary, struct led_rgb secondary,
-                             unsigned int warmth)
+                             const struct le_music_palette *pal)
 {
-    unsigned int width = (2U + f->loudness_fast / 70U) * 256U;  /* 2..5 px */
-    /* Free-running unless the beat is locked, then one pixel per beat. */
-    unsigned int center = le_pos8(state->motion_q16, 0U);
-    unsigned int level = 30U + f->energy / 2U + state->onset_env / 4U;
-    struct led_rgb ribbon = le_lerp(primary, secondary, warmth);
+    unsigned int head = le_pos8(state->motion_q16, 0U);
+    unsigned int kick = state->onset_env;
+    unsigned int tail = 768U + kick * 2U;            /* 3..5 px */
+    unsigned int level = le_punch(le_body_level(f) + 40U, kick);
+    struct led_rgb lead = le_lerp(pal->primary, pal->accent, kick * 3U / 4U);
     unsigned int i;
 
-    if (level > 255U)
-        level = 255U;
     for (i = 0U; i < LE_LED_PIXELS; i++) {
-        unsigned int d = le_distance8(i, center);
-        if (d < width) {
-            unsigned int frac = (width - d) * 255U / width;
-            le_add(&out[i], ribbon, le_mul255(frac, level));
+        /* Distance behind the head, 0..RING8-1. */
+        unsigned int behind = (head + LE_RING8 - i * 256U) % LE_RING8;
+        unsigned int ahead = LE_RING8 - behind;
+
+        if (behind < tail) {
+            unsigned int frac = (tail - behind) * 255U / tail;
+            struct led_rgb colour = le_lerp(pal->secondary, lead, frac);
+
+            le_add(&out[i], colour, le_mul255(le_mul255(frac, frac), level));
+        } else if (ahead < 256U) {
+            le_add(&out[i], lead, le_mul255(256U - ahead - 1U, level));
         }
     }
+    if (state->snare_env > 0U)
+        le_dot(out, (head + 6U * 256U) % LE_RING8, 300U, pal->secondary,
+               state->snare_env);
 }
 
+/* Propeller: two opposite blades turning together.  They swell and flare on
+   a kick; a snare tips them with the accent. */
 static void le_render_twin_arcs(struct led_rgb out[LE_LED_PIXELS],
                                 const struct le_music_features *f,
                                 const struct le_music_render_state *state,
-                                struct led_rgb primary,
-                                struct led_rgb secondary)
+                                const struct le_music_palette *pal)
 {
-    unsigned int env = state->onset_env;
-    /* Arc half-length 1.1..2 px: at most four pixels per arc, so at most
-       eight of twelve are ever lit and the ring never fills. */
-    unsigned int half = 288U + f->density / 2U + env / 4U;
-    unsigned int weight = 24U + f->loudness_fast / 2U + env * 104U / 255U;
+    unsigned int kick = state->onset_env;
     unsigned int a = le_pos8(state->motion_q16, 0U);
     unsigned int b = (a + 6U * 256U) % LE_RING8;
-    unsigned int i;
+    unsigned int half = 300U + kick * 3U / 2U;       /* 1.2..2.7 px */
+    unsigned int level = le_punch(le_body_level(f), kick);
 
-    if (half > 512U)
-        half = 512U;
-    if (weight > 255U)
-        weight = 255U;
-    for (i = 0U; i < LE_LED_PIXELS; i++) {
-        unsigned int d0 = le_distance8(i, a);
-        unsigned int d1 = le_distance8(i, b);
-        unsigned int d = d0 < d1 ? d0 : d1;
-        if (d < half) {
-            unsigned int frac = (half - d) * 255U / half;
-            struct led_rgb colour = (d0 <= d1) ? primary : secondary;
-            le_add(&out[i], colour, le_mul255(frac, weight));
-        }
-    }
-    /* Transient accents land on the arc heads, never on dark pixels. */
-    if (f->onset_high > 120U) {
-        unsigned int head = ((a + 128U) / 256U) % LE_LED_PIXELS;
-        unsigned int accent = f->onset_high;
-        le_add(&out[head], primary, accent);
-        le_add(&out[(head + 6U) % LE_LED_PIXELS], secondary, accent);
+    le_dot(out, a, half, pal->primary, level);
+    le_dot(out, b, half, pal->secondary, level);
+    if (state->snare_env > 0U) {
+        le_dot(out, a, 200U, pal->accent, state->snare_env);
+        le_dot(out, b, 200U, pal->accent, state->snare_env);
     }
 }
 
+/* Counter-rotation: two dots circle in opposite directions and flare where
+   they cross.  A kick swells both, a hat glints between them. */
 static void le_render_orbit(struct led_rgb out[LE_LED_PIXELS],
                             const struct le_music_features *f,
-                            struct le_music_render_state *state,
-                            struct led_rgb primary, struct led_rgb secondary)
+                            const struct le_music_render_state *state,
+                            const struct le_music_palette *pal)
 {
-    unsigned int center;
-    unsigned int size = 1U + f->onset_low / 90U;
-    unsigned int level = 40U + f->energy / 2U;
-    unsigned int i;
+    unsigned int kick = state->onset_env;
+    unsigned int a = le_pos8(state->motion_q16, 0U);
+    unsigned int b = (LE_RING8 - a) % LE_RING8;
+    unsigned int half = 330U + kick;                 /* 1.3..2.3 px */
+    unsigned int level = le_punch(le_body_level(f) + 20U, kick);
 
-    if (f->beat_confidence >= 110U) {
-        center = (f->beat_phase * LE_LED_PIXELS) / 65536U;
-    } else {
-        /* Free-running and deterministic: position follows the render clock
-           (one pixel per 180 ms whatever the frame rate), offset by the
-           session seed, never beat phase. */
-        center = (state->clock_ms / LE_ORBIT_STEP_MS + state->free_phase) %
-                 LE_LED_PIXELS;
-    }
-    if (f->events & LE_MUSIC_EVENT_SNARE)
-        size++;
-    for (i = 0U; i < LE_LED_PIXELS; i++) {
-        unsigned int d0 = le_distance(i, center);
-        unsigned int d1 = le_distance(i, (center + 6U) % LE_LED_PIXELS);
-        unsigned int d = d0 < d1 ? d0 : d1;
-        if (d < size) {
-            unsigned int frac = (size - d) * 255U / size;
-            struct led_rgb colour = (d0 <= d1) ? primary : secondary;
-            le_add(&out[i], colour, le_mul255(frac, level));
-        }
-    }
+    le_dot(out, a, half, pal->primary, level);
+    le_dot(out, b, half, pal->secondary, level);
+    if (state->hat_env > 0U)
+        le_dot(out, (a + 3U * 256U) % LE_RING8, 200U, pal->accent,
+               state->hat_env * 2U / 3U);
 }
 
+static void le_ripple(struct led_rgb out[LE_LED_PIXELS], unsigned int origin8,
+                      unsigned int age, unsigned int life, unsigned int reach,
+                      struct led_rgb from, struct led_rgb to,
+                      unsigned int level)
+{
+    unsigned int radius;
+    unsigned int fade;
+    struct led_rgb colour;
+
+    if (age >= life)
+        return;
+    radius = age * reach / life;
+    fade = (life - age) * 255U / life;
+    colour = le_lerp(from, to, 255U - fade);
+    level = le_mul255(level, fade);
+    if (radius < 128U) {
+        le_dot(out, origin8, 330U, colour, level);
+        return;
+    }
+    le_dot(out, (origin8 + radius) % LE_RING8, 330U, colour, level);
+    le_dot(out, (origin8 + LE_RING8 - radius) % LE_RING8, 330U, colour,
+           level);
+}
+
+/* Bloom: every kick opens a ripple that runs both ways round the ring from a
+   point that hops on each hit; a snare answers from the far side.  A faint
+   pilot dot keeps turning between hits. */
 static void le_render_split_pulse(struct led_rgb out[LE_LED_PIXELS],
                                   const struct le_music_features *f,
-                                  struct led_rgb primary,
-                                  struct led_rgb secondary)
+                                  const struct le_music_render_state *state,
+                                  const struct le_music_palette *pal)
 {
-    unsigned int count = (f->onset_high > f->onset_low) ? 4U : 2U;
-    unsigned int step = LE_LED_PIXELS / count;
-    unsigned int size = 1U + f->loudness_fast / 80U;
-    unsigned int i;
+    unsigned int origin = state->bloom_origin * 256U;
 
-    for (i = 0U; i < LE_LED_PIXELS; i++) {
-        unsigned int region = i % step;
-        unsigned int in_region = region < size;
-        unsigned int band;
-        if (!in_region)
-            continue;
-        if (i < 4U)
-            band = f->onset_low;
-        else if (i < 9U)
-            band = f->onset_mid;
-        else
-            band = f->onset_high;
-        le_add(&out[i], (i % 2U == 0U) ? primary : secondary, band);
-    }
+    le_dot(out, le_pos8(state->motion_q16, 0U), 300U, pal->secondary,
+           le_body_level(f) / 2U);
+    le_ripple(out, origin, state->kick_ripple_ms, LE_RIPPLE_KICK_MS,
+              5U * 256U + 128U, pal->accent, pal->primary,
+              le_punch(120U, state->kick_ripple_level));
+    le_ripple(out, (origin + 6U * 256U) % LE_RING8, state->snare_ripple_ms,
+              LE_RIPPLE_SNARE_MS, 3U * 256U, pal->secondary, pal->secondary,
+              le_punch(60U, state->snare_ripple_level));
 }
 
+/* Mirrored meter: a bar grows both ways from an axis that turns with the
+   ring.  It rests as a dot and slams out on a kick; a snare lights the
+   tips. */
 static void le_render_classic_mirror(struct led_rgb out[LE_LED_PIXELS],
                                      const struct le_music_features *f,
-                                     struct le_music_render_state *state,
-                                     struct led_rgb primary,
-                                     struct led_rgb secondary)
+                                     const struct le_music_render_state *state,
+                                     const struct le_music_palette *pal)
 {
-    unsigned int rotate = (f->beat_phase * 2U) / 65536U;  /* 0..1 */
-    unsigned int bands[6];
+    unsigned int axis = le_pos8(state->motion_q16, 0U);
+    unsigned int kick = state->onset_env;
+    /* Half-length under a pixel at rest, up to 4.5 px on a kick. */
+    unsigned int reach = 160U + f->loudness_fast / 3U + kick * 7U / 2U;
+    unsigned int level = le_punch(le_body_level(f) + 20U, kick);
     unsigned int i;
 
-    bands[0] = f->onset_low;
-    bands[1] = f->onset_low / 2U + f->onset_mid / 2U;
-    bands[2] = f->onset_mid;
-    bands[3] = f->onset_mid / 2U + f->onset_high / 2U;
-    bands[4] = f->onset_high;
-    bands[5] = f->energy;
+    if (reach > 1152U)
+        reach = 1152U;
+    for (i = 0U; i < LE_LED_PIXELS; i++) {
+        unsigned int d = le_distance8(i, axis);
+        unsigned int cover;
 
-    for (i = 0U; i < 6U; i++) {
-        unsigned int at = (i + rotate) % 6U;
-        unsigned int mirrored = (LE_LED_PIXELS - 1U - at) % LE_LED_PIXELS;
-        if (bands[i] > state->peak[i])
-            state->peak[i] = bands[i];
-        else {
-            unsigned int fall = state->step_ms * LE_PEAK_FALL_PER_TICK /
-                                LE_PEAK_FALL_TICK_MS;
-            state->peak[i] = state->peak[i] > fall ? state->peak[i] - fall : 0U;
-        }
-        le_add(&out[at], primary, state->peak[i]);
-        le_add(&out[mirrored], secondary, state->peak[i]);
+        if (d >= reach + 128U)
+            continue;
+        cover = d + 128U <= reach ? 255U : (reach + 128U - d) * 255U / 256U;
+        le_add(&out[i], le_lerp(pal->primary, pal->secondary,
+                                d * 255U / 1536U),
+               le_mul255(cover, level));
+        if (state->snare_env > 0U && d + 256U > reach)
+            le_add(&out[i], pal->accent,
+                   le_mul255(cover, state->snare_env * 2U / 3U));
     }
 }
 
+/* Chase: three dots a third of the ring apart running round together.  A
+   kick flares them, a snare throws the chase into reverse. */
 static void le_render_ember(struct led_rgb out[LE_LED_PIXELS],
                             const struct le_music_features *f,
-                            struct le_music_render_state *state,
-                            struct led_rgb primary, struct led_rgb secondary)
+                            const struct le_music_render_state *state,
+                            const struct le_music_palette *pal)
 {
-    /* The block drifts at half the shared motion rate. */
-    unsigned int center = le_pos8(state->motion_q16 / 2U, 0U);
-    unsigned int env = state->onset_env;
-    unsigned int level = le_mul255(f->loudness_fast, 130U) + env * 90U / 255U;
-    unsigned int i;
+    unsigned int kick = state->onset_env;
+    unsigned int at = le_pos8(state->chase_q16, 0U);
+    unsigned int half = 280U + kick / 2U;            /* 1.1..1.6 px */
+    unsigned int level = le_punch(le_body_level(f) + 10U, kick);
 
-    if (level > 220U)
-        level = 220U;
-    /* Bass-weighted amber/red motion with substantial black space: a block
-       of at most five pixels plus two opposite sparks on bass hits. */
-    for (i = 0U; i < LE_LED_PIXELS; i++) {
-        unsigned int d = le_distance8(i, center);
-        if (d < 640U) {
-            unsigned int cover = d <= 384U ? 255U : (640U - d) * 255U / 256U;
-            le_add(&out[i], primary, le_mul255(cover, level));
-        } else if (d >= 1152U && d < 1408U) {
-            le_add(&out[i], secondary, env / 2U);
-        }
-    }
-    /* Sparse cool transient sparks. */
-    if (f->transientness > 120U) {
-        unsigned int spark = (f->timestamp_ms / 240U) % LE_LED_PIXELS;
-        le_add(&out[spark], (struct led_rgb){120U, 170U, 255U},
-               f->transientness);
+    le_dot(out, at, half, pal->primary, level);
+    le_dot(out, (at + 4U * 256U) % LE_RING8, half, pal->secondary, level);
+    le_dot(out, (at + 8U * 256U) % LE_RING8, half,
+           le_lerp(pal->primary, pal->accent, state->hat_env), level);
+}
+
+static void le_render_grammar(struct led_rgb out[LE_LED_PIXELS],
+                              enum le_music_grammar grammar,
+                              const struct le_music_features *f,
+                              const struct le_music_render_state *state,
+                              const struct le_music_palette *pal)
+{
+    switch (grammar) {
+    case LE_GRAMMAR_RIBBON:
+        le_render_ribbon(out, f, state, pal);
+        break;
+    case LE_GRAMMAR_TWIN_ARCS:
+        le_render_twin_arcs(out, f, state, pal);
+        break;
+    case LE_GRAMMAR_ORBIT:
+        le_render_orbit(out, f, state, pal);
+        break;
+    case LE_GRAMMAR_SPLIT_PULSE:
+        le_render_split_pulse(out, f, state, pal);
+        break;
+    case LE_GRAMMAR_CLASSIC_MIRROR:
+        le_render_classic_mirror(out, f, state, pal);
+        break;
+    case LE_GRAMMAR_EMBER:
+        le_render_ember(out, f, state, pal);
+        break;
+    default:
+        break;
     }
 }
 
@@ -452,7 +592,6 @@ void le_music_render_at(const struct le_music_scene *scene,
                         struct led_rgb out[LE_LED_PIXELS])
 {
     struct led_rgb primary;
-    struct led_rgb secondary;
     struct led_rgb accent;
     unsigned int blend = scene->crossfade;
     unsigned int i;
@@ -460,37 +599,23 @@ void le_music_render_at(const struct le_music_scene *scene,
     for (i = 0U; i < LE_LED_PIXELS; i++)
         out[i] = (struct led_rgb){0U, 0U, 0U};
 
-    primary = le_lerp(scene->palette.primary, scene->next_palette.primary,
-                      blend);
-    secondary = le_lerp(scene->palette.secondary,
-                        scene->next_palette.secondary, blend);
-    accent = le_lerp(scene->palette.accent, scene->next_palette.accent, blend);
     le_render_advance(state, features, clock_ms);
+    le_render_grammar(out, scene->grammar, features, state, &scene->palette);
+    /* A scene change dissolves from one look into the next. */
+    if (blend > 0U) {
+        struct led_rgb next[LE_LED_PIXELS];
 
-    switch (scene->grammar) {
-    case LE_GRAMMAR_RIBBON:
-        le_render_ribbon(out, features, state, primary, secondary,
-                         features->warmth);
-        break;
-    case LE_GRAMMAR_TWIN_ARCS:
-        le_render_twin_arcs(out, features, state, primary, secondary);
-        break;
-    case LE_GRAMMAR_ORBIT:
-        le_render_orbit(out, features, state, primary, secondary);
-        break;
-    case LE_GRAMMAR_SPLIT_PULSE:
-        le_render_split_pulse(out, features, primary, secondary);
-        break;
-    case LE_GRAMMAR_CLASSIC_MIRROR:
-        le_render_classic_mirror(out, features, state, primary, secondary);
-        break;
-    case LE_GRAMMAR_EMBER:
-        le_render_ember(out, features, state, primary, secondary);
-        break;
-    default:
-        break;
+        for (i = 0U; i < LE_LED_PIXELS; i++)
+            next[i] = (struct led_rgb){0U, 0U, 0U};
+        le_render_grammar(next, scene->next_grammar, features, state,
+                          &scene->next_palette);
+        for (i = 0U; i < LE_LED_PIXELS; i++)
+            out[i] = le_lerp(out[i], next[i], blend);
     }
 
+    primary = le_lerp(scene->palette.primary, scene->next_palette.primary,
+                      blend);
+    accent = le_lerp(scene->palette.accent, scene->next_palette.accent, blend);
     if (scene->effect != LE_EFFECT_NONE)
         le_render_effect(out, scene, primary, accent);
 }
