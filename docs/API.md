@@ -2141,6 +2141,40 @@ That bypasses signature verification for the selected package; fetched and
 automatic updates never honor the header. The UI explicitly warns about this
 trust decision before uploading.
 
+#### GET /api/v1/system/ntp
+
+Returns the time servers (#369). `servers` is the saved override as a
+comma-separated list, or `""` when the image defaults apply; `custom` says
+which. `defaults` lists the image's public servers and `active` the peers the
+time daemon is using now (from `/run/libreecho/time.status`).
+
+```json
+{ "servers": "192.168.1.1,ntp.lan", "custom": true,
+  "defaults": "time.cloudflare.com,time.nist.gov,ntp1.npl.co.uk,ntp2.npl.co.uk",
+  "active": "192.168.1.1,ntp.lan" }
+```
+
+#### PUT /api/v1/system/ntp
+
+Sets up to four time servers, separated by commas or spaces, as host names or
+IPv4/IPv6 addresses. Each is 1–253 characters of letters, digits and `.-_:`,
+the same rules `libreecho-timed` applies. They are written atomically as
+`server <peer>` lines to `/data/libreecho/config/ntp.conf` (beside
+`web-config.json`, mode 0600), the persistent override described in
+`docs/TIMEKEEPING.md`. An empty string removes the override so the image
+defaults apply again.
+
+```json
+{ "servers": "192.168.1.1, ntp.lan" }
+```
+
+The time daemon reads its peers only at start, so on a device it is restarted
+and the response (the GET body) reports `"applies": "now"`;
+`"next-start"` means the file was saved but no restart was possible (the mock
+backend). A fifth server, any other character, or a non-string is rejected with
+400 and the saved file is left untouched; 503 means the file could not be
+written or the time daemon could not be restarted.
+
 #### GET /api/v1/system/timezone
 
 Returns the configured timezone, the IANA name it was picked as, and who sets it:

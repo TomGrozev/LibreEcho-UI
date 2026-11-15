@@ -4606,6 +4606,63 @@
     }
    }
   },
+  "/system/ntp": {
+   "get": {
+    "tags": [
+     "System"
+    ],
+    "summary": "Read the time servers",
+    "description": "Returns servers (the saved override, comma-separated, or empty when the image defaults apply), custom, defaults (the image's public servers) and active (the peers the time daemon uses now).",
+    "responses": {
+     "200": {
+      "$ref": "#/components/responses/Success"
+     }
+    }
+   },
+   "put": {
+    "tags": [
+     "System"
+    ],
+    "summary": "Set the time servers",
+    "description": "Up to four NTP servers separated by commas or spaces; each is 1-253 letters, digits or .-_: (host name or IPv4/IPv6 address). Stored as the persistent override timed reads; an empty string removes it so the image defaults apply. The time daemon is restarted so the change applies now (applies: now; next-start when it could not be restarted).",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Csrf"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "servers"
+        ],
+        "properties": {
+         "servers": {
+          "type": "string",
+          "maxLength": 1099,
+          "description": "Comma- or space-separated servers, e.g. 192.168.1.1, ntp.lan; empty for the defaults"
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "$ref": "#/components/responses/Success"
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
   "/system/timezone": {
    "get": {
     "tags": [

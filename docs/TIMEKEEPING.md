@@ -55,6 +55,11 @@ persistent file is ignored in favour of the immutable image defaults.
 The override lives on userdata and therefore survives boot-image flashes and
 OTA updates.
 
+Owners set it from Device settings › Time servers, or with
+`PUT /api/v1/system/ntp` (see `docs/API.md`). The web daemon applies the same
+peer rules, writes the file atomically, and restarts `libreecho-timed`, which
+reads its peers only at start. Saving an empty list removes the file.
+
 ## Time zone
 
 The clock stays UTC; the time zone is presentation only. It is a POSIX TZ

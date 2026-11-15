@@ -501,6 +501,7 @@ while ! curl -fsS "$URL/api/v1/status" >/dev/null 2>&1; do i=$((i+1)); [ "$i" -l
 LIBREECHO_TEST_URL="$URL" sh tests/test_timers_api.sh
 LIBREECHO_TEST_URL="$URL" sh tests/test_api.sh
 LIBREECHO_TEST_URL="$URL" LIBREECHO_TEST_CONFIG="$CFG" sh tests/test_timezone_api.sh
+sh tests/test_ntp_api.sh
 LIBREECHO_TEST_URL="$URL" sh tests/test_https_trust_api.sh
 sh tests/test_https_pem_api.sh
 python3 tests/test_voice_clips_contract.py
