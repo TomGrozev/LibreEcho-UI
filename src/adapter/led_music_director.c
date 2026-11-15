@@ -7,7 +7,11 @@
 #define LE_SECTION_NOVELTY     150U
 #define LE_BUILD_MIN           130U
 #define LE_EVENT_STRENGTH_MIN  110U
-#define LE_QUIET_GAP_FRAMES    8U
+/* A quiet gap counts as structure after this long (was 8 frames at the
+   original ~11.7 fps producer rate). */
+#define LE_QUIET_GAP_SECONDS   0.68
+/* EMA time constant: a quarter step per ~85 ms frame at 11.7 fps. */
+#define LE_EMA_SECONDS         0.256
 #define LE_STALE_DWELLS        1.2
 
 static const struct {
@@ -174,7 +178,8 @@ static void le_consider_effect(struct le_music_director *d,
                     f->build >= LE_BUILD_MIN ||
                     (events & LE_MUSIC_EVENT_BUILD) ||
                     (events & LE_MUSIC_EVENT_FILL) ||
-                    d->quiet_frames >= LE_QUIET_GAP_FRAMES;
+                    (d->quiet &&
+                     (now - d->quiet_since) >= LE_QUIET_GAP_SECONDS);
 
     if (!le_effect_ready(d, now))
         return;
@@ -223,9 +228,20 @@ void le_music_director_update(struct le_music_director *d,
         d->scene_started = now;
         d->have_scene_time = 1;
     } else {
-        d->confidence_ema = (d->confidence_ema * 3U + f->beat_confidence) / 4U;
-        d->build_ema = (d->build_ema * 3U + f->build) / 4U;
+        /* Same wall-time response at any producer frame rate. */
+        double dt = now - d->last_update;
+        double a;
+        if (dt < 0.0)
+            dt = 0.0;
+        a = dt / (dt + LE_EMA_SECONDS);
+        d->confidence_ema = (unsigned int)
+            ((double)d->confidence_ema +
+             ((double)f->beat_confidence - (double)d->confidence_ema) * a + 0.5);
+        d->build_ema = (unsigned int)
+            ((double)d->build_ema +
+             ((double)f->build - (double)d->build_ema) * a + 0.5);
     }
+    d->last_update = now;
 
     /* Expire a running transition. */
     if (d->effect != LE_EFFECT_NONE &&
@@ -236,10 +252,12 @@ void le_music_director_update(struct le_music_director *d,
     le_consider_effect(d, f, now);
 
     if (f->loudness_fast < 40U || f->energy < 50U) {
-        if (d->quiet_frames < 10000U)
-            d->quiet_frames++;
+        if (!d->quiet) {
+            d->quiet = 1;
+            d->quiet_since = now;
+        }
     } else {
-        d->quiet_frames = 0U;
+        d->quiet = 0;
     }
 
     /* Scene changes: dwell-gated, primarily structural. */

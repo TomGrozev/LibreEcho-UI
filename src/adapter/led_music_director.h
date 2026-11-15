@@ -65,7 +65,9 @@ struct le_music_director {
 
     unsigned int confidence_ema;
     unsigned int build_ema;
-    unsigned int quiet_frames;
+    double last_update;      /* EMAs follow elapsed time, not frame count */
+    double quiet_since;
+    int quiet;
     int have_history;
 
     enum le_music_effect effect;

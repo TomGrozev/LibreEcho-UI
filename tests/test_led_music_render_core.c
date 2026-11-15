@@ -162,6 +162,40 @@ static unsigned int longest_static_ms(enum le_music_grammar grammar,
     return longest;
 }
 
+/*
+ * Simulate ledd timing for `ms` milliseconds: producer frames every
+ * period_x10/10 ms (constant features, beat phase following bpm) and a 33 ms
+ * render tick between them, each render on the frame timeline extended by
+ * the time since the frame.  Returns the last rendered frame in out.
+ */
+static void run_stream(enum le_music_grammar grammar, struct led_rgb accent,
+                       struct le_music_features base, unsigned int period_x10,
+                       unsigned int ms, struct le_music_render_state *state,
+                       struct led_rgb out[LE_LED_PIXELS])
+{
+    struct le_music_scene scene = scene_for(grammar, accent);
+    struct le_music_features f = base;
+    unsigned int t, next_x10 = 0U, seq = 0U;
+
+    le_music_render_state_reset(state, 1U);
+    for (t = 0U; t <= ms; t++) {
+        int fresh = 0;
+        if (t * 10U >= next_x10) {
+            f = base;
+            f.seq = ++seq;
+            f.timestamp_ms = 1000U + t;
+            if (base.bpm_x100 != 0U)
+                f.beat_phase = (unsigned int)
+                    (((unsigned long)t * base.bpm_x100 * 65536UL / 6000000UL) &
+                     0xFFFFUL);
+            next_x10 += period_x10;
+            fresh = 1;
+        }
+        if (fresh || t % 33U == 0U)
+            le_music_render_at(&scene, &f, state, 1000U + t, out);
+    }
+}
+
 int main(void)
 {
     struct led_rgb accent;
@@ -413,6 +447,87 @@ int main(void)
         le_music_render_at(&scene, &f, &state, 1085U, out);
         require_condition(memcmp(first, out, sizeof(out)) == 0,
                           "a clock step backwards must hold the ring");
+    }
+
+    /* 10. Producer frame rate (11.7 vs 23.4 fps) must not change speed:
+       free-running and beat-locked motion land within 0.15 px after 3 s,
+       and the low-confidence orbit is placed by time, not per frame. */
+    {
+        struct le_music_render_state slow, fast;
+        struct led_rgb out_slow[LE_LED_PIXELS], out_fast[LE_LED_PIXELS];
+        int k;
+        for (k = 0; k < 2; k++) {
+            unsigned int d;
+            f = feat();
+            f.beat_confidence = k == 0 ? 40U : 220U;
+            f.bpm_x100 = k == 0 ? 0U : 12000U;
+            run_stream(LE_GRAMMAR_TWIN_ARCS, accent, f, 854U, 3000U, &slow,
+                       out_slow);
+            run_stream(LE_GRAMMAR_TWIN_ARCS, accent, f, 427U, 3000U, &fast,
+                       out_fast);
+            d = slow.motion_q16 > fast.motion_q16
+                ? slow.motion_q16 - fast.motion_q16
+                : fast.motion_q16 - slow.motion_q16;
+            if (d > 9830U)
+                fprintf(stderr, "render: motion %u vs %u\n", slow.motion_q16,
+                        fast.motion_q16);
+            require_condition(d <= 9830U,
+                              "motion speed must not depend on frame rate");
+            require_condition(slow.motion_q16 != 65536U,   /* session 1 start */
+                              "the ring must have moved");
+        }
+        f = feat();
+        f.beat_confidence = 40U;
+        run_stream(LE_GRAMMAR_ORBIT, accent, f, 854U, 2970U, &slow, out_slow);
+        run_stream(LE_GRAMMAR_ORBIT, accent, f, 427U, 2970U, &fast, out_fast);
+        require_condition(memcmp(out_slow, out_fast, sizeof(out_slow)) == 0,
+                          "the free-running orbit must be placed by time");
+    }
+
+    /* 11. A latched event (KICK held for 4 frames at 23.4 fps, 2 at 11.7 fps)
+       triggers one flash, not one per frame. */
+    {
+        struct le_music_scene scene = scene_for(LE_GRAMMAR_TWIN_ARCS, accent);
+        unsigned int period_x10;
+        for (period_x10 = 427U; period_x10 <= 854U; period_x10 += 427U) {
+            unsigned int t, next_x10 = 0U, seq = 0U, frame = 0U;
+            unsigned int hold = period_x10 == 427U ? 4U : 2U;
+            unsigned int kicks = 0U, prev_env = 0U, peak = 0U;
+            le_music_render_state_reset(&state, 1U);
+            f = feat();
+            for (t = 0U; t <= 2000U; t++) {
+                int fresh = 0;
+                if (t * 10U >= next_x10) {
+                    f = feat();
+                    f.beat_confidence = 40U;
+                    f.onset_low = 40U;
+                    f.events = 0U;
+                    if (frame >= 12U && frame < 12U + hold) {
+                        f.events = LE_MUSIC_EVENT_KICK;   /* latched */
+                        f.onset_low = 200U;               /* held level */
+                    }
+                    f.seq = ++seq;
+                    f.timestamp_ms = 1000U + t;
+                    next_x10 += period_x10;
+                    frame++;
+                    fresh = 1;
+                }
+                if (fresh || t % 33U == 0U) {
+                    le_music_render_at(&scene, &f, &state, 1000U + t, out);
+                    if (state.onset_env > prev_env)
+                        kicks++;
+                    if (state.onset_env > peak)
+                        peak = state.onset_env;
+                    prev_env = state.onset_env;
+                }
+            }
+            if (kicks != 1U)
+                fprintf(stderr, "render: %u kicks at period %u.%u ms\n", kicks,
+                        period_x10 / 10U, period_x10 % 10U);
+            require_condition(kicks == 1U,
+                              "a latched event must flash once, not per frame");
+            require_condition(peak >= 200U, "the latched kick must flash");
+        }
     }
 
     puts("music renderer: ok");

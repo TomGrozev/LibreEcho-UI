@@ -14,6 +14,13 @@
 /* Onset envelope: instant attack, linear release from full in this time. */
 #define LE_ONSET_RELEASE_MS  200U
 #define LE_ONSET_MARGIN      12U
+/* onset_low baseline time constant (frame-rate independent). */
+#define LE_ONSET_FLOOR_MS    700U
+/* Classic mirror peak release: 12 levels per 33 ms render tick. */
+#define LE_PEAK_FALL_PER_TICK  12U
+#define LE_PEAK_FALL_TICK_MS 33U
+/* Low-confidence orbit: one pixel per 180 ms of render clock. */
+#define LE_ORBIT_STEP_MS     180U
 /* Longest clock step honoured at once (a stall must not jump the ring). */
 #define LE_MAX_STEP_MS       500U
 
@@ -88,8 +95,11 @@ void le_music_render_state_reset(struct le_music_render_state *state,
  * Advance motion and the onset envelope to clock_ms.  Motion free-runs on the
  * render clock, faster with loudness/energy, unless the beat is locked: then
  * it advances exactly one pixel per beat (bpm, or the beat-phase delta when
- * no tempo is reported).  Onsets are taken once per new producer frame,
- * relative to a slow baseline so a constant onset level does not strobe.
+ * no tempo is reported).  Everything is time-based, so the producer frame
+ * rate (11.7 or 23.4 fps) does not change speeds.  The envelope kicks only on
+ * a rising edge: onset_low rising above the previous frame and a slow
+ * baseline, or a KICK flag that was clear in the previous frame (the producer
+ * latches event flags across several frames).
  */
 static void le_render_advance(struct le_music_render_state *s,
                               const struct le_music_features *f,
@@ -111,6 +121,7 @@ static void le_render_advance(struct le_music_render_state *s,
     }
     if (dt > LE_MAX_STEP_MS)
         dt = LE_MAX_STEP_MS;
+    s->step_ms = dt;
 
     fall = dt * 255U / LE_ONSET_RELEASE_MS;
     s->onset_env = s->onset_env > fall ? s->onset_env - fall : 0U;
@@ -132,18 +143,34 @@ static void le_render_advance(struct le_music_render_state *s,
 
     if (new_frame) {
         unsigned int kick = 0U;
-        if (!s->have_frame)
+        unsigned int frame_dt;
+        if (!s->have_frame) {
             s->onset_floor = f->onset_low;
-        if (f->onset_low > s->onset_floor + LE_ONSET_MARGIN) {
+            s->last_onset = f->onset_low;
+            s->last_events = 0U;
+        }
+        frame_dt = s->have_frame ? f->timestamp_ms - s->last_frame_ms : 0U;
+        if (frame_dt > LE_ONSET_FLOOR_MS)
+            frame_dt = LE_ONSET_FLOOR_MS;
+        if (f->onset_low > s->last_onset + LE_ONSET_MARGIN &&
+            f->onset_low > s->onset_floor + LE_ONSET_MARGIN) {
             kick = (f->onset_low - s->onset_floor) * 2U;
             if (kick > 255U)
                 kick = 255U;
         }
-        if ((f->events & LE_MUSIC_EVENT_KICK) && f->onset_low > kick)
+        if ((f->events & LE_MUSIC_EVENT_KICK) &&
+            !(s->last_events & LE_MUSIC_EVENT_KICK) && f->onset_low > kick)
             kick = f->onset_low;
         if (kick > s->onset_env)
             s->onset_env = kick;
-        s->onset_floor = (s->onset_floor * 7U + f->onset_low + 4U) / 8U;
+        if (f->onset_low >= s->onset_floor)
+            s->onset_floor += ((f->onset_low - s->onset_floor) * frame_dt +
+                               LE_ONSET_FLOOR_MS / 2U) / LE_ONSET_FLOOR_MS;
+        else
+            s->onset_floor -= ((s->onset_floor - f->onset_low) * frame_dt +
+                               LE_ONSET_FLOOR_MS / 2U) / LE_ONSET_FLOOR_MS;
+        s->last_onset = f->onset_low;
+        s->last_events = f->events;
         s->last_seq = f->seq;
         s->last_frame_ms = f->timestamp_ms;
         s->last_phase = f->beat_phase & 0xFFFFU;
@@ -228,11 +255,11 @@ static void le_render_orbit(struct led_rgb out[LE_LED_PIXELS],
     if (f->beat_confidence >= 110U) {
         center = (f->beat_phase * LE_LED_PIXELS) / 65536U;
     } else {
-        /* Free-running and deterministic: position advances with the
-           producer's monotonic timestamp, never with beat phase. */
-        state->free_phase = (f->timestamp_ms / 180U + state->free_phase) %
-                            LE_LED_PIXELS;
-        center = state->free_phase;
+        /* Free-running and deterministic: position follows the render clock
+           (one pixel per 180 ms whatever the frame rate), offset by the
+           session seed, never beat phase. */
+        center = (state->clock_ms / LE_ORBIT_STEP_MS + state->free_phase) %
+                 LE_LED_PIXELS;
     }
     if (f->events & LE_MUSIC_EVENT_SNARE)
         size++;
@@ -296,8 +323,11 @@ static void le_render_classic_mirror(struct led_rgb out[LE_LED_PIXELS],
         unsigned int mirrored = (LE_LED_PIXELS - 1U - at) % LE_LED_PIXELS;
         if (bands[i] > state->peak[i])
             state->peak[i] = bands[i];
-        else
-            state->peak[i] = state->peak[i] > 12U ? state->peak[i] - 12U : 0U;
+        else {
+            unsigned int fall = state->step_ms * LE_PEAK_FALL_PER_TICK /
+                                LE_PEAK_FALL_TICK_MS;
+            state->peak[i] = state->peak[i] > fall ? state->peak[i] - fall : 0U;
+        }
         le_add(&out[at], primary, state->peak[i]);
         le_add(&out[mirrored], secondary, state->peak[i]);
     }
@@ -329,8 +359,8 @@ static void le_render_ember(struct led_rgb out[LE_LED_PIXELS],
     }
     /* Sparse cool transient sparks. */
     if (f->transientness > 120U) {
-        state->free_phase = (f->timestamp_ms / 240U) % LE_LED_PIXELS;
-        le_add(&out[state->free_phase], (struct led_rgb){120U, 170U, 255U},
+        unsigned int spark = (f->timestamp_ms / 240U) % LE_LED_PIXELS;
+        le_add(&out[spark], (struct led_rgb){120U, 170U, 255U},
                f->transientness);
     }
 }

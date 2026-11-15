@@ -32,6 +32,9 @@ struct le_music_render_state {
     unsigned int motion_q16;           /* ring position, 1 px == 65536 */
     unsigned int onset_env;            /* bass hit envelope 0..255 */
     unsigned int onset_floor;          /* slow onset_low baseline */
+    unsigned int last_onset;           /* last frame onset_low */
+    unsigned int last_events;          /* last frame event flags */
+    unsigned int step_ms;              /* clock advance of this render */
 };
 
 void le_music_render_state_reset(struct le_music_render_state *state,

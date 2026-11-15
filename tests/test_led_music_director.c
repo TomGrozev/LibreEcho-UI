@@ -288,6 +288,33 @@ int main(void)
                           "a steady segment must change within ~1.2 dwells");
     }
 
+    /* 12. Confidence tracking follows time, not frame count: a drop in
+       beat confidence reads the same at 11.7 and 23.4 fps. */
+    {
+        struct le_music_director slow, fast;
+        double step;
+        unsigned int diff;
+        for (step = 0.0854; step > 0.04; step /= 2.0) {
+            struct le_music_director *d = step > 0.06 ? &slow : &fast;
+            le_music_director_reset(d, 23U, &cfg);
+            for (i = 0, t = 0.0; t < 1.3; i++, t += step) {
+                f = feat();
+                f.seq = (unsigned int)(i + 1);
+                f.timestamp_ms = (unsigned int)(t * 1000.0);
+                f.beat_confidence = t < 1.0 ? 200U : 40U;
+                le_music_director_update(d, &f, t);
+            }
+        }
+        diff = slow.confidence_ema > fast.confidence_ema
+             ? slow.confidence_ema - fast.confidence_ema
+             : fast.confidence_ema - slow.confidence_ema;
+        if (diff > 12U)
+            fprintf(stderr, "director: ema %u vs %u\n", slow.confidence_ema,
+                    fast.confidence_ema);
+        require_condition(diff <= 12U,
+                          "confidence smoothing must not depend on frame rate");
+    }
+
     puts("music scene director: ok");
     return 0;
 }
