@@ -4681,7 +4681,7 @@
      "System"
     ],
     "summary": "Set the timezone",
-    "description": "A POSIX TZ string such as CST6CDT,M3.2.0,M11.1.0; there is no zoneinfo database on the device, so IANA names are not accepted as timezone. name optionally records the IANA name for the picker. Angle-bracket names (<+04>-4) are stored as letters (LST-4). source home_assistant makes esphomed store the zone Home Assistant reports over ESPHome; timezone is optional then. Daemons that render local time follow the change within seconds (applies: now); others at the next boot.",
+    "description": "A POSIX TZ string such as CST6CDT,M3.2.0,M11.1.0; there is no zoneinfo database on the device, so IANA names are not accepted as timezone. name optionally records the IANA name for the picker. Angle-bracket names (<+04>-4) are stored as letters (LST-4). source home_assistant makes esphomed store the zone Home Assistant reports over ESPHome; timezone is optional then. Daemons that render or schedule by local time (including timerd, which reschedules pending alarms and reminders to the same local time) follow the change within seconds (applies: now); others at the next boot.",
     "parameters": [
      {
       "$ref": "#/components/parameters/Csrf"

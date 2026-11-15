@@ -460,6 +460,48 @@ int main(void)
         assert(timer->due_epoch == SYNCED_EPOCH + 86400LL + 8 * 3600LL);
     }
 
+    /* A one-off alarm keeps its local time across a restart (saved as a v4
+       record with no repeat days, which older daemons read as a one-off) so a
+       later zone change can move it; a snoozed one is saved as a plain v3
+       one-off because its due instant is relative time. Old v3 files load
+       without a local time. */
+    {
+        struct context zone;
+        unsigned int plain = 0, snz = 0;
+
+        setenv("TZ", "UTC0", 1);
+        tzset();
+        memset(&zone, 0, sizeof(zone));
+        zone.state_path = path;
+        zone.state_loaded = 1;
+        le_timer_set_init(&zone.timers);
+        unlink(path);
+        assert(le_timer_add_alarm(&zone.timers, SYNCED_EPOCH + 9 * 3600LL,
+                                  "p", SYNCED_EPOCH, &plain) == LE_TIMER_OK);
+        assert(le_timer_add_alarm(&zone.timers, SYNCED_EPOCH + 10 * 3600LL,
+                                  "s", SYNCED_EPOCH, &snz) == LE_TIMER_OK);
+        le_timer_find(&zone.timers, snz)->snoozed = 1;
+        assert(state_save_at(&zone, 1000, SYNCED_EPOCH) == STATE_SAVE_OK);
+        read_text(path, text, sizeof(text));
+        assert(strstr(text, "v4 alarm 1 1767258000 0 9 0 @hex:70") != NULL);
+        assert(strstr(text, "v3 alarm 2 1767261600 @hex:73") != NULL);
+
+        le_timer_set_init(&zone.timers);
+        assert(state_load_at(&zone, 1000, SYNCED_EPOCH) == 1);
+        assert(le_timer_find(&zone.timers, 1)->local_time == 1);
+        assert(le_timer_find(&zone.timers, 2)->local_time == 0);
+        /* The loop's zone hook: a new zone moves the restored 09:00 alarm. */
+        setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+        tzset();
+        assert(le_timer_rezone(&zone.timers, SYNCED_EPOCH) == 1);
+        assert(le_timer_find(&zone.timers, 1)->due_epoch ==
+               SYNCED_EPOCH + 8 * 3600LL);
+        assert(le_timer_find(&zone.timers, 2)->due_epoch ==
+               SYNCED_EPOCH + 10 * 3600LL);
+        setenv("TZ", "UTC0", 1);
+        tzset();
+    }
+
     puts("timer persistence: ok");
     return 0;
 }

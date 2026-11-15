@@ -2963,6 +2963,7 @@ static void alarm_days_text(unsigned mask,char*out,size_t size){
 static void alarm_create_json(struct api_context*c,const struct api_request*q,struct api_response*r){
  char time_text[8]="",label[48]="",days_text[48]="";unsigned id=0,days=0;int hour=0,minute=0,label_result,time_result,days_result;long long due=0;
  if(json_duplicate_key(q->body,q->body_len,"time")||json_duplicate_key(q->body,q->body_len,"label")||json_duplicate_key(q->body,q->body_len,"days")){err(r,400,LE_INVALID,"Alarm fields must not be duplicated");return;}
+ (void)le_timezone_follow(c->config_path[0]?c->config_path:NULL);/* due_epoch below is computed here, so use the current zone */
  time_result=json_get_string_top_level(q->body,"time",time_text,sizeof(time_text));
  if(time_result!=1||!alarm_time_parse(time_text,&hour,&minute)){err(r,400,LE_INVALID,"time is required as HH:MM on a 24-hour clock");return;}
  label_result=json_get_string_top_level(q->body,"label",label,sizeof(label));
@@ -2992,6 +2993,7 @@ static void alarm_create_json(struct api_context*c,const struct api_request*q,st
 static void reminder_create_json(struct api_context*c,const struct api_request*q,struct api_response*r){
  char time_text[8]="",label[48]="",days_text[48]="";unsigned id=0,days=0;int hour=0,minute=0,label_result,time_result,days_result;long long due=0;
  if(json_duplicate_key(q->body,q->body_len,"time")||json_duplicate_key(q->body,q->body_len,"label")||json_duplicate_key(q->body,q->body_len,"days")){err(r,400,LE_INVALID,"Reminder fields must not be duplicated");return;}
+ (void)le_timezone_follow(c->config_path[0]?c->config_path:NULL);/* due_epoch below is computed here, so use the current zone */
  time_result=json_get_string_top_level(q->body,"time",time_text,sizeof(time_text));
  if(time_result!=1||!alarm_time_parse(time_text,&hour,&minute)){err(r,400,LE_INVALID,"time is required as HH:MM on a 24-hour clock");return;}
  label_result=json_get_string_top_level(q->body,"label",label,sizeof(label));

@@ -75,9 +75,11 @@ database) and set from Device settings, the setup wizard, or Home Assistant:
   configured zone, which esphomed stores. Only the zone is taken; the clock
   itself still comes from NTP and the RTC.
 - The initramfs exports the stored zone as `TZ` before the service graph
-  starts. LED night mode, the assistant's clock and the live-session time tool
-  also re-read it within seconds of a change (`src/timezone.h`); other daemons
-  pick it up at the next boot.
+  starts. LED night mode, the assistant's clock, the live-session time tool and
+  `timerd` also re-read it within seconds of a change (`src/timezone.h`);
+  `timerd` then moves pending alarms and reminders to the same local time of
+  day (countdowns, a ringing alarm and a snoozed alarm stay as they are).
+  Other daemons pick it up at the next boot.
 
 The initramfs only exports letters, digits and `+-:,./`, so angle-bracket
 abbreviations (`<+04>-4`) are stored as `LST`/`LDT` (`LST-4`). Offsets and

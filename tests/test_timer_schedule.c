@@ -607,6 +607,109 @@ int main(void)
         assert(!le_timer_sunrise_due(&set, SYNCED_EPOCH, 5, &id, &due));
     }
 
+    /* A zone change moves pending wall-clock alarms and reminders to the
+       same local time in the new zone (UTC0 -> CET, 2026-01-15 00:00 UTC is a
+       Thursday). Countdowns, ringing alarms and snoozes are not wall-clock
+       times and stay put. */
+    {
+        static const char utc[] = "UTC0";
+        static const char cet[] = "CET-1CEST,M3.5.0,M10.5.0/3";
+        const long long now = 1768435200LL;
+        struct le_timer_set set;
+        unsigned int oneoff, repeat, reminder, countdown, ringing, snoozed, legacy;
+        long long ring_due, snooze_due;
+        unsigned int fired[LE_TIMER_MAX];
+        long long due;
+
+        setenv("TZ", utc, 1);
+        tzset();
+        le_timer_set_init(&set);
+        assert(le_timer_next_alarm_epoch(now, 9, 0, &due) == LE_TIMER_OK);
+        assert(due == now + 9 * 3600);
+        assert(le_timer_add_alarm(&set, due, "one", now, &oneoff) == LE_TIMER_OK);
+        assert(le_timer_add_repeat_alarm(&set, 7, 30, 0x3eU, "wd", now,
+                                         &repeat) == LE_TIMER_OK);
+        assert(le_timer_add_reminder(&set, 12, 0, 0, "rem", now, &reminder) ==
+               LE_TIMER_OK);
+        assert(le_timer_add_countdown(&set, 3600, "cd", 5000, &countdown) ==
+               LE_TIMER_OK);
+        /* A legacy one-off restored without a local time is not rezoned. */
+        assert(le_timer_restore_alarm_with_id(&set, 90, now + 20 * 3600, "old",
+                                              now, 5000, &legacy) == LE_TIMER_OK);
+        /* A restored one-off with a local time is. */
+        assert(le_timer_restore_repeat_alarm(&set, 91, now + 10 * 3600, 10, 0, 0,
+                                             "kept", now, 5000, &oneoff) ==
+               LE_TIMER_OK);
+        assert(le_timer_find(&set, 91)->local_time == 1);
+        assert(le_timer_find(&set, legacy)->local_time == 0);
+        {
+            long long cd_due = le_timer_find(&set, countdown)->due_monotonic_ms;
+            long long legacy_due = le_timer_find(&set, legacy)->due_epoch;
+
+            assert(le_timer_rezone(&set, now) == 0); /* same zone: no change */
+            setenv("TZ", cet, 1);
+            tzset();
+            /* one-off 09:00, restored one-off 10:00, weekday 07:30, reminder 12:00 */
+            assert(le_timer_rezone(&set, now) == 4);
+            assert(le_timer_find(&set, 91)->due_epoch == now + 9 * 3600);
+            assert(le_timer_find(&set, repeat)->due_epoch == now + 6 * 3600 + 1800);
+            assert(le_timer_find(&set, reminder)->due_epoch == now + 11 * 3600);
+            assert(le_timer_find(&set, countdown)->due_monotonic_ms == cd_due);
+            assert(le_timer_find(&set, legacy)->due_epoch == legacy_due);
+            /* Back to UTC restores the original instants. */
+            setenv("TZ", utc, 1);
+            tzset();
+            assert(le_timer_rezone(&set, now) == 4);
+            assert(le_timer_find(&set, 91)->due_epoch == now + 10 * 3600);
+            assert(le_timer_find(&set, repeat)->due_epoch == now + 7 * 3600 + 1800);
+            /* No credible clock, no rescheduling. */
+            assert(le_timer_rezone(&set, BOOT_EPOCH) == 0);
+            assert(le_timer_rezone(NULL, now) == 0);
+        }
+        /* A ringing alarm and a snoozed one (both 09:00 UTC one-offs) stay put:
+           the ring has already started and a snooze is relative time. */
+        le_timer_set_init(&set);
+        setenv("TZ", utc, 1);
+        tzset();
+        assert(le_timer_add_alarm(&set, now + 9 * 3600, "ring", now, &ringing) ==
+               LE_TIMER_OK);
+        assert(le_timer_add_alarm(&set, now + 9 * 3600, "snz", now, &snoozed) ==
+               LE_TIMER_OK);
+        assert(le_timer_step(&set, 6000, now + 9 * 3600, fired, LE_TIMER_MAX) == 2);
+        assert(le_timer_ringing_count(&set) == 2);
+        assert(le_timer_snooze_ringing(&set, now + 9 * 3600 + 10) == 2);
+        snooze_due = now + 9 * 3600 + 10 + LE_TIMER_SNOOZE_SECONDS;
+        assert(le_timer_find(&set, snoozed)->due_epoch == snooze_due);
+        assert(le_timer_step(&set, 7000, snooze_due, fired, LE_TIMER_MAX) == 2);
+        /* "ring" keeps ringing; "snz" is snoozed again from a later moment. */
+        ring_due = le_timer_find(&set, ringing)->due_epoch;
+        le_timer_find(&set, snoozed)->state = LE_TIMER_STATE_PENDING;
+        le_timer_find(&set, snoozed)->due_epoch = snooze_due + 300;
+        le_timer_find(&set, snoozed)->snoozed = 1;
+        snooze_due += 300;
+        setenv("TZ", cet, 1);
+        tzset();
+        assert(le_timer_rezone(&set, snooze_due - 100) == 0);
+        assert(le_timer_find(&set, ringing)->state == LE_TIMER_STATE_RINGING);
+        assert(le_timer_find(&set, ringing)->due_epoch == ring_due);
+        assert(le_timer_find(&set, snoozed)->due_epoch == snooze_due);
+        /* Once the snoozed alarm rings and is dismissed it is a plain one-off
+           again, but a one-off is cleared by dismissal, so nothing remains. */
+
+        /* The API one-off: created in UTC, 09:00 becomes 08:00 UTC in CET. */
+        le_timer_set_init(&set);
+        setenv("TZ", utc, 1);
+        tzset();
+        assert(le_timer_add_alarm(&set, now + 9 * 3600, "api", now, &oneoff) ==
+               LE_TIMER_OK);
+        setenv("TZ", cet, 1);
+        tzset();
+        assert(le_timer_rezone(&set, now) == 1);
+        assert(le_timer_find(&set, oneoff)->due_epoch == now + 8 * 3600);
+        setenv("TZ", "UTC0", 1);
+        tzset();
+    }
+
     printf("timer schedule: ok\n");
     return 0;
 }

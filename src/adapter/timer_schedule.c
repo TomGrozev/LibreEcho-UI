@@ -83,6 +83,16 @@ int le_timer_add_alarm(struct le_timer_set *set, long long due_epoch,
     timer->kind = LE_TIMER_ALARM;
     timer->state = LE_TIMER_STATE_PENDING;
     timer->due_epoch = due_epoch;
+    {
+        time_t when = (time_t)due_epoch;
+        struct tm *zoned = localtime(&when);
+
+        if (zoned && zoned->tm_sec == 0) {
+            timer->local_time = 1;
+            timer->hour = zoned->tm_hour;
+            timer->minute = zoned->tm_min;
+        }
+    }
     set_label(timer, label);
     if (id)
         *id = timer->id;
@@ -105,6 +115,9 @@ static int restore_timer(struct le_timer_set *set, enum le_timer_kind kind,
         return LE_TIMER_ERR_CLOCK;
     if (reminder && (kind != LE_TIMER_ALARM || (days & ~LE_TIMER_DAYS_ALL) ||
                      hour < 0 || hour > 23 || minute < 0 || minute > 59))
+        return LE_TIMER_ERR_RANGE;
+    if (!days && !reminder && hour >= 0 &&
+        (kind != LE_TIMER_ALARM || hour > 23 || minute < 0 || minute > 59))
         return LE_TIMER_ERR_RANGE;
     if (days) {
         /* A repeat that expired while the device was down is not a miss: its
@@ -145,8 +158,11 @@ static int restore_timer(struct le_timer_set *set, enum le_timer_kind kind,
     timer->due_monotonic_ms = now_monotonic_ms + delta * 1000LL;
     timer->repeat_days = days;
     timer->reminder = reminder;
-    timer->hour = days || reminder ? hour : 0;
-    timer->minute = days || reminder ? minute : 0;
+    /* A one-off alarm saved with a local time (days zero, hour >= 0) keeps
+       it; older records carry none (callers pass hour -1). */
+    timer->local_time = !days && !reminder && hour >= 0;
+    timer->hour = days || reminder || timer->local_time ? hour : 0;
+    timer->minute = days || reminder || timer->local_time ? minute : 0;
     set_label(timer, label);
     if (id)
         *id = timer->id;
@@ -322,7 +338,7 @@ int le_timer_restore_countdown(struct le_timer_set *set, long long due_epoch,
                                long long now_monotonic_ms, unsigned int *id)
 {
     return restore_timer(set, LE_TIMER_COUNTDOWN, 0, due_epoch, label,
-                         now_epoch, now_monotonic_ms, id, 0, 0, 0, 0);
+                         now_epoch, now_monotonic_ms, id, 0, -1, 0, 0);
 }
 
 int le_timer_restore_alarm(struct le_timer_set *set, long long due_epoch,
@@ -330,7 +346,7 @@ int le_timer_restore_alarm(struct le_timer_set *set, long long due_epoch,
                            long long now_monotonic_ms, unsigned int *id)
 {
     return restore_timer(set, LE_TIMER_ALARM, 0, due_epoch, label, now_epoch,
-                         now_monotonic_ms, id, 0, 0, 0, 0);
+                         now_monotonic_ms, id, 0, -1, 0, 0);
 }
 
 int le_timer_restore_repeat_alarm(struct le_timer_set *set,
@@ -365,7 +381,7 @@ int le_timer_restore_countdown_with_id(struct le_timer_set *set,
                                        unsigned int *id)
 {
     return restore_timer(set, LE_TIMER_COUNTDOWN, restore_id, due_epoch, label,
-                         now_epoch, now_monotonic_ms, id, 0, 0, 0, 0);
+                         now_epoch, now_monotonic_ms, id, 0, -1, 0, 0);
 }
 
 int le_timer_restore_alarm_with_id(struct le_timer_set *set,
@@ -375,7 +391,7 @@ int le_timer_restore_alarm_with_id(struct le_timer_set *set,
                                    unsigned int *id)
 {
     return restore_timer(set, LE_TIMER_ALARM, restore_id, due_epoch, label,
-                         now_epoch, now_monotonic_ms, id, 0, 0, 0, 0);
+                         now_epoch, now_monotonic_ms, id, 0, -1, 0, 0);
 }
 
 struct le_timer *le_timer_find(struct le_timer_set *set, unsigned int id)
@@ -425,6 +441,7 @@ static void retire(struct le_timer *timer, long long now_epoch)
         timer->state = LE_TIMER_STATE_PENDING;
         timer->due_epoch = next;
         timer->ring_started_ms = 0;
+        timer->snoozed = 0;
         return;
     }
     memset(timer, 0, sizeof(*timer));
@@ -467,6 +484,38 @@ int le_timer_dismiss_all(struct le_timer_set *set)
     return le_timer_dismiss_all_at(set, 0);
 }
 
+int le_timer_rezone(struct le_timer_set *set, long long now_epoch)
+{
+    size_t i;
+    int changed = 0;
+
+    if (!set || now_epoch < LE_TIMER_CLOCK_VALID_EPOCH)
+        return 0;
+    for (i = 0; i < LE_TIMER_MAX; ++i) {
+        struct le_timer *timer = &set->timers[i];
+        long long due;
+        int result;
+
+        if (timer->state != LE_TIMER_STATE_PENDING ||
+            timer->kind != LE_TIMER_ALARM || timer->snoozed)
+            continue;
+        if (timer->repeat_days)
+            result = le_timer_next_repeat_epoch(now_epoch, timer->hour,
+                                                timer->minute,
+                                                timer->repeat_days, &due);
+        else if (timer->reminder || timer->local_time)
+            result = le_timer_next_alarm_epoch(now_epoch, timer->hour,
+                                               timer->minute, &due);
+        else
+            continue;
+        if (result != LE_TIMER_OK || due == timer->due_epoch)
+            continue;
+        timer->due_epoch = due;
+        ++changed;
+    }
+    return changed;
+}
+
 int le_timer_snooze_ringing(struct le_timer_set *set, long long now_epoch)
 {
     size_t i;
@@ -483,6 +532,7 @@ int le_timer_snooze_ringing(struct le_timer_set *set, long long now_epoch)
         timer->state = LE_TIMER_STATE_PENDING;
         timer->due_epoch = now_epoch + LE_TIMER_SNOOZE_SECONDS;
         timer->ring_started_ms = 0;
+        timer->snoozed = 1;
         ++snoozed;
     }
     return snoozed;

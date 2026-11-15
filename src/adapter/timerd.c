@@ -20,6 +20,7 @@
 #include "timer_schedule.h"
 #include "../json.h"
 #include "../log.h"
+#include "../timezone.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -38,7 +39,9 @@
 #define STATE_PATH "/data/libreecho/config/timers"
 #define TTS_SOCK LE_ADAPTER_TTS_SOCK
 #define MAX_CLIENTS 4
-#define POLL_CAP_MS 60000
+/* Also the longest idle sleep, so a zone change is noticed within
+   LE_TIMEZONE_RECHECK_SECONDS plus a little. */
+#define POLL_CAP_MS (LE_TIMEZONE_RECHECK_SECONDS * 1000)
 #define RESTORE_RETRY_MS 1000
 #define AUDIO_TIMEOUT_MS 1000
 #define LED_TIMEOUT_MS 1000
@@ -134,6 +137,25 @@ static long long monotonic_ms(void)
 static long long wall_epoch(void)
 {
     return (long long)time(NULL);
+}
+
+/* ------------------------------ time zone ------------------------------- */
+
+/* Follow the configured zone (timezone.h) and, when it changed, move every
+   pending wall-clock alarm and reminder to the same local time in the new
+   zone. A one-off alarm is saved as a "v4 alarm" record with days 0 so its
+   local time survives a restart; a daemon without that field reads it as the
+   plain one-off it always was. */
+static void zone_follow(struct context *ctx)
+{
+    int moved;
+
+    if (!le_timezone_follow(NULL))
+        return;
+    moved = le_timer_rezone(&ctx->timers, wall_epoch());
+    le_log_info("timerd: time zone changed; rescheduled %d alarm(s)", moved);
+    if (moved)
+        ctx->dirty = 1;
 }
 
 /* ------------------------------ persistence ----------------------------- */
@@ -412,7 +434,8 @@ static enum state_save_result state_save_at(struct context *ctx,
                  ? fprintf(file, "v5 reminder %u %lld %u %d %d %s\n", timer->id,
                            due, timer->repeat_days, timer->hour, timer->minute,
                            encoded_label)
-                 : timer->kind == LE_TIMER_ALARM && timer->repeat_days
+                 : timer->kind == LE_TIMER_ALARM &&
+                   (timer->repeat_days || (timer->local_time && !timer->snoozed))
                  ? fprintf(file, "v4 alarm %u %lld %u %d %d %s\n", timer->id,
                            due, timer->repeat_days, timer->hour, timer->minute,
                            encoded_label)
@@ -1118,6 +1141,8 @@ static int dispatch(struct context *ctx, const char *cmd, const char *args,
     long long wide_value = 0;
     int label_result = 0;
 
+    /* A request that computes a due time must see the current zone. */
+    zone_follow(ctx);
     if (!strcmp(cmd, "remote_event"))
         return remote_event(ctx, args, id, out, size);
     if (!strcmp(cmd, "remote_clear")) {
@@ -1523,6 +1548,7 @@ int main(int argc, char **argv)
 
         if (!ctx.state_loaded && now_epoch >= LE_TIMER_CLOCK_VALID_EPOCH)
             (void)state_load(&ctx);
+        zone_follow(&ctx);
         count = le_timer_step(&ctx.timers, now_ms, now_epoch, fired,
                               LE_TIMER_MAX);
         if (count > 0) {
