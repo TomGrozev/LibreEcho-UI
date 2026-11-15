@@ -554,7 +554,9 @@ static int dispatch(unsigned idx,unsigned type,const unsigned char *p,size_t n){
  case 119:if(S.owner!=(int)idx)return -1;if(S.turn){(void)announce_done(0);return 0;}
  if(dnd_on()){(void)announce_done(1);return 0;}
  if(ep_get_text(p,n,1,url,sizeof url)||ep_get_text(p,n,3,S.next_url,sizeof S.next_url))return -1;S.turn=3;S.announcement=1;S.voice_open=1;S.turn_deadline=S.now+S.turn_limit;S.continue_turn=!!ep_get_uint(p,n,4,0);snprintf(S.tts_url,sizeof S.tts_url,"%s",url);
- if(S.next_url[0]){char pre[1024];snprintf(pre,sizeof pre,"%s",S.next_url);snprintf(S.next_url,sizeof S.next_url,"%s",url);if(playback_start(pre)<0)turn_clear("playback_error",1);}else if(playback_start(url)<0)turn_clear("playback_error",1);status_write();return 0;
+ /* Field 3 is HA's preannounce chime (an ffmpeg_proxy WAV), field 1 the announcement: the chime plays first while
+  * next_url holds the announcement. A chime that cannot play is skipped, never the announcement. */
+ {char pre[1024];snprintf(pre,sizeof pre,"%s",S.next_url);snprintf(S.next_url,sizeof S.next_url,"%s",url);if(!pre[0]||playback_start(pre)<0){S.next_url[0]=0;if(playback_start(url)<0)turn_clear("playback_error",1);}}status_write();return 0;
  case 121:configuration(c);return 0;
  case 123:{struct ep_reader r;struct ep_field f;unsigned count=0;int active=0;ep_reader_init(&r,p,n);while(ep_next(&r,&f)>0)if(f.number==1){if(++count>1||ep_text(&f,url,sizeof url)||strcmp(url,"alexa_v0.1"))return -1;active=1;}
  if(wake_set_active(active))return -1;configuration(c);return 0;}
@@ -734,7 +736,8 @@ int main(int argc,char **argv){const char *bind_addr="0.0.0.0";unsigned port=605
  stream_tick(&S.mic,1);stream_tick(&S.wake,0);control_tick();capture_tick();
  if(!S.turn&&S.owner>=0)(void)server_listen_start();
  if(S.turn&&S.now>S.turn_deadline)cancel_turn("timeout");
- if(S.playing){int rc=esp_playback_tick(&S.playback,S.now);if(rc){playback_stopped();if(rc<0)turn_clear("playback_error",1);else if(S.next_url[0]){char next[1024];snprintf(next,sizeof next,"%s",S.next_url);S.next_url[0]=0;if(playback_start(next)<0)turn_clear("playback_error",1);}else completed();}}
+ /* next_url is set only while a preannounce plays: the announcement follows whether the chime finished or failed. */
+ if(S.playing){int rc=esp_playback_tick(&S.playback,S.now);if(rc){playback_stopped();if(S.next_url[0]){char next[1024];snprintf(next,sizeof next,"%s",S.next_url);S.next_url[0]=0;if(playback_start(next)<0)turn_clear("playback_error",1);}else if(rc<0)turn_clear("playback_error",1);else completed();}}
  /* Thinking: the reply is coming, so power the speaker output up now (about
   * 1.2 s) behind STT and the LLM instead of after the reply's first byte. */
  if(S.turn==3&&!S.playing)esp_playback_warm(&S.playback,S.bus_path,S.now);

@@ -222,6 +222,24 @@ class Fixture(Daemon):
    with wave.open(wav,'wb') as w:w.setnchannels(1);w.setsampwidth(2);w.setframerate(48000);w.writeframes(struct.pack('<h',sample)*count)
    urls.append(self.http_audio(wav.getvalue()))
   self.hello();self.s.sendall(frame(89,num(1,1)+num(2,4)));self.s.sendall(frame(119,text(1,urls[1])+text(3,urls[0])));self.wait_completion();self.assertEqual(self.sound(),struct.pack('<h',900)*2000+struct.pack('<h',1800)*2400)
+ def test_failed_preannounce_still_plays_announcement(self):
+  # Field 3 is HA's chime (an ffmpeg_proxy WAV), field 1 the announcement: a chime that cannot start, that HA's proxy
+  # answers with an empty 200 (its ffmpeg failed), or whose stream breaks before the terminator is skipped; the
+  # announcement still plays and succeeds.
+  wav=io.BytesIO()
+  with wave.open(wav,'wb') as w:w.setnchannels(1);w.setsampwidth(2);w.setframerate(48000);w.writeframes(struct.pack('<h',1800)*1200)
+  data=wav.getvalue();main=self.http_audio(data)
+  class Broken(BaseHTTPRequestHandler):
+   protocol_version='HTTP/1.1'
+   def do_GET(self):
+    chunk=b'' if self.path=='/empty.wav' else data[:44]+struct.pack('<h',900)*100;self.send_response(200);self.send_header('Transfer-Encoding','chunked');self.send_header('Connection','close');self.end_headers()
+    self.wfile.write(f'{len(chunk):x}\r\n'.encode()+chunk+b'\r\n' if chunk else b'0\r\n\r\n');self.wfile.flush()
+   def log_message(self,*args):pass
+  server=ThreadingHTTPServer(('127.0.0.1',0),Broken);thread=threading.Thread(target=server.serve_forever);thread.start();self.addCleanup(server.server_close);self.addCleanup(thread.join,2);self.addCleanup(server.shutdown)
+  self.hello();self.s.sendall(frame(89,num(1,1)+num(2,4)))
+  for chime in ['file:///invalid.wav',f'http://127.0.0.1:{server.server_port}/empty.wav',f'http://127.0.0.1:{server.server_port}/broken.wav']:
+   self.busbytes=bytearray();self.s.sendall(frame(119,text(1,main)+text(3,chime)));self.wait_completion();self.assertEqual(self.sound(),struct.pack('<h',1800)*2400,chime)
+   self.assertEqual(json.loads((self.p/'status.json').read_text())['last_result'],'success',chime)
  def time_zone_exchange(self,source,*zones):
   """Subscribe states, answer the device's GetTimeRequest (36) like HA does (GetTimeResponse 37), return the stored config."""
   cfg=json.loads(self.config.read_text())
