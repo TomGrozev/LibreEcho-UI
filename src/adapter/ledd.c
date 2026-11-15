@@ -773,13 +773,15 @@ static void output_render_transfer(struct daemon_context *ctx,
 }
 
 /*
- * Smoothed drive levels for every gamma-transfer frame (#364 follow-up).
+ * Smoothed drive levels for every gamma- and linear-transfer frame (#364
+ * follow-up; music frames use the linear transfer).
  *
  * The integer path rounds each channel to a whole PWM code after the gamma-2
  * transfer, so anything that fades or pulses at low brightness steps visibly
  * (a pulse at 20% red only spans a handful of codes).  When the kernel offers
  * the IS31 current scale, follow the exact gamma-2 curve in fine units
- * instead, and pick the nearest level the chip can show.  A uniform ring is
+ * (or, for linear music frames, the exact linear level) instead, and pick
+ * the nearest level the chip can show.  A uniform ring is
  * also dithered spatially between the two nearest levels, as the sleep pulse
  * does, so its average lands between them too.
  *
@@ -790,7 +792,8 @@ static void output_render_transfer(struct daemon_context *ctx,
  * code, and a lit channel never drops to black.
  */
 static double smooth_fine_target(unsigned int channel, double brightness,
-                                 unsigned int gain)
+                                 unsigned int gain,
+                                 enum led_output_transfer transfer)
 {
     double v;
 
@@ -803,6 +806,8 @@ static double smooth_fine_target(unsigned int channel, double brightness,
         v = v * (double)gain / 255.0;
     if (v > 255.0)
         v = 255.0;
+    if (transfer == LE_OUTPUT_TRANSFER_LINEAR)
+        return v * (double)FINE_UNITS;
     return v * v / 255.0 * (double)FINE_UNITS;
 }
 
@@ -844,7 +849,8 @@ static unsigned int smooth_floor_level(const struct hardware *hw,
 
 static void output_smooth_fine(struct daemon_context *ctx,
                                const struct led_rgb logical[RING_PIXELS],
-                               double brightness)
+                               double brightness,
+                               enum led_output_transfer transfer)
 {
     const struct led_output_calibration *cal = led_output_default_calibration();
     struct pixel fine[RING_PIXELS];
@@ -872,7 +878,8 @@ static void output_smooth_fine(struct daemon_context *ctx,
             unsigned int code = k == 0U ? ctx->rendered_pixels[i].r
                               : k == 1U ? ctx->rendered_pixels[i].g
                                         : ctx->rendered_pixels[i].b;
-            double target = smooth_fine_target(channel, brightness, gains[k]);
+            double target = smooth_fine_target(channel, brightness, gains[k],
+                                               transfer);
             unsigned int level;
 
             smooth_bracket(&ctx->hw, target, code * FINE_UNITS, &below, &above);
@@ -915,7 +922,7 @@ static void output_commit_level(struct daemon_context *ctx,
         brightness = 100.0;
     whole = (unsigned int)(brightness + 0.5);
     output_render_transfer(ctx, logical, whole, LE_OUTPUT_TRANSFER_GAMMA);
-    output_smooth_fine(ctx, logical, brightness);
+    output_smooth_fine(ctx, logical, brightness, LE_OUTPUT_TRANSFER_GAMMA);
     (void)output_flush(ctx, monotonic_seconds(), 0);
 }
 
@@ -940,7 +947,12 @@ static void output_commit_transfer(struct daemon_context *ctx,
         output_commit_level(ctx, logical, (double)brightness);
         return;
     }
+    /* Linear (music) frames: same fine-level route, following the exact
+       linear target instead of the gamma-2 curve. */
+    if (brightness > 100U)
+        brightness = 100U;
     output_render_transfer(ctx, logical, brightness, transfer);
+    output_smooth_fine(ctx, logical, (double)brightness, transfer);
     (void)output_flush(ctx, monotonic_seconds(), 0);
 }
 
