@@ -47,7 +47,7 @@ static void require_condition(int condition, const char *message)
     }
 }
 
-static char last_response[1024];
+static char last_response[8192];   /* a status reply is a few kB */
 
 static void fire(struct daemon_context *ctx, const char *line)
 {
@@ -858,6 +858,37 @@ int main(void)
     require_condition(ctx.music_session == 42U && ctx.music_features.seq == 1U,
                       "session and sequence must be tracked");
 
+    /* Status reports the scene and its mood, and no feature debug dump. */
+    fire(&ctx, "{\"v\":1,\"id\":1,\"cmd\":\"status\"}");
+    require_condition(response_ok(), "status must answer during music");
+    {
+        const char *music = strstr(last_response, "\"music\":{\"active\":true,");
+        const char *end = music != NULL ? strchr(music, '}') : NULL;
+        const char *mood = music != NULL ? strstr(music, "\"mood\":\"") : NULL;
+        require_condition(music != NULL && end != NULL,
+                          "status must report the active music scene");
+        require_condition(mood != NULL && mood < end,
+                          "the music status must carry the mood");
+        mood += strlen("\"mood\":\"");
+        require_condition(strncmp(mood, "calm\"", 5U) == 0 ||
+                          strncmp(mood, "balanced\"", 9U) == 0 ||
+                          strncmp(mood, "energetic\"", 10U) == 0 ||
+                          strncmp(mood, "intense\"", 8U) == 0,
+                          "the mood must be one of the four mood names");
+        require_condition(strncmp(mood, le_music_mood_name(
+                                            ctx.music_director.mood),
+                                  strlen(le_music_mood_name(
+                                             ctx.music_director.mood))) == 0,
+                          "status must report the director's mood");
+        require_condition(strstr(music, "\"grammar\":\"") != NULL &&
+                          strstr(music, "\"grammar\":\"") < end &&
+                          strstr(music, "\"session\":42") != NULL &&
+                          strstr(music, "\"session\":42") < end,
+                          "the music status must name grammar and session");
+        require_condition(strstr(last_response, "\"dbg\"") == NULL,
+                          "status must not dump raw feature frames");
+    }
+
     build_v2(frame, sizeof(frame), 1U, 1000U, 42U);   /* duplicate */
     fire(&ctx, frame);
     require_condition(strstr(last_response, "\"accepted\":false") != NULL,
@@ -884,6 +915,13 @@ int main(void)
                       "a legacy spectrum frame must still be accepted");
     require_condition(!ctx.music_active,
                       "a legacy frame must not be treated as v2 music");
+    fire(&ctx, "{\"v\":1,\"id\":1,\"cmd\":\"status\"}");
+    require_condition(strstr(last_response, "\"music\":{\"active\":false,"
+                                            "\"grammar\":\"none\","
+                                            "\"mood\":\"none\",") != NULL,
+                      "without a music scene status must report no mood");
+    require_condition(strstr(last_response, "\"dbg\"") == NULL,
+                      "status must not dump raw feature frames");
 
     /* A malformed v2 frame is rejected outright. */
     reset(&ctx);
