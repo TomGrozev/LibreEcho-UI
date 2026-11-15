@@ -3,6 +3,20 @@
 
 #include <string.h>
 
+/* Sub-pixel ring geometry: motion is kept in 1/65536 px, drawing in 1/256 px.
+   motion_q16 wraps at two revolutions so half-speed drift stays continuous. */
+#define LE_PX_Q16            65536U
+#define LE_RING_Q16          ((unsigned int)LE_LED_PIXELS * LE_PX_Q16)
+#define LE_MOTION_WRAP       (2U * LE_RING_Q16)
+#define LE_RING8             ((unsigned int)LE_LED_PIXELS * 256U)
+/* Beat phase is trusted for motion only above this confidence (as orbit). */
+#define LE_BEAT_LOCK         110U
+/* Onset envelope: instant attack, linear release from full in this time. */
+#define LE_ONSET_RELEASE_MS  200U
+#define LE_ONSET_MARGIN      12U
+/* Longest clock step honoured at once (a stall must not jump the ring). */
+#define LE_MAX_STEP_MS       500U
+
 static unsigned int le_mul255(unsigned int value, unsigned int factor)
 {
     return (value * factor + 127U) / 255U;
@@ -47,6 +61,19 @@ static unsigned int le_distance(unsigned int a, unsigned int b)
     return d > LE_LED_PIXELS / 2U ? LE_LED_PIXELS - d : d;
 }
 
+/* Circular distance from pixel i to a sub-pixel position (both 1/256 px). */
+static unsigned int le_distance8(unsigned int i, unsigned int pos8)
+{
+    unsigned int at = i * 256U;
+    unsigned int d = at > pos8 ? at - pos8 : pos8 - at;
+    return d > LE_RING8 / 2U ? LE_RING8 - d : d;
+}
+
+static unsigned int le_pos8(unsigned int q16, unsigned int offset_px)
+{
+    return ((q16 >> 8) + offset_px * 256U) % LE_RING8;
+}
+
 void le_music_render_state_reset(struct le_music_render_state *state,
                                  unsigned int session)
 {
@@ -54,24 +81,96 @@ void le_music_render_state_reset(struct le_music_render_state *state,
         return;
     memset(state, 0, sizeof(*state));
     state->free_phase = session % LE_LED_PIXELS;
+    state->motion_q16 = (session % LE_LED_PIXELS) * LE_PX_Q16;
+}
+
+/*
+ * Advance motion and the onset envelope to clock_ms.  Motion free-runs on the
+ * render clock, faster with loudness/energy, unless the beat is locked: then
+ * it advances exactly one pixel per beat (bpm, or the beat-phase delta when
+ * no tempo is reported).  Onsets are taken once per new producer frame,
+ * relative to a slow baseline so a constant onset level does not strobe.
+ */
+static void le_render_advance(struct le_music_render_state *s,
+                              const struct le_music_features *f,
+                              unsigned int clock_ms)
+{
+    unsigned int dt = 0U;
+    unsigned int step = 0U;
+    unsigned int fall;
+    int locked = f->beat_confidence >= LE_BEAT_LOCK;
+    int new_frame = !s->have_frame || f->seq != s->last_seq ||
+                    f->timestamp_ms != s->last_frame_ms;
+
+    if (!s->have_clock) {
+        s->clock_ms = clock_ms;
+        s->have_clock = 1;
+    } else if (clock_ms - s->clock_ms < 0x80000000U) {
+        dt = clock_ms - s->clock_ms;
+        s->clock_ms = clock_ms;
+    }
+    if (dt > LE_MAX_STEP_MS)
+        dt = LE_MAX_STEP_MS;
+
+    fall = dt * 255U / LE_ONSET_RELEASE_MS;
+    s->onset_env = s->onset_env > fall ? s->onset_env - fall : 0U;
+
+    if (locked && f->bpm_x100 >= 4000U) {
+        unsigned int bpm = f->bpm_x100 > 24000U ? 24000U : f->bpm_x100;
+        step = dt * (bpm * LE_PX_Q16 / 6000000U);   /* 1 px per beat */
+    } else if (locked) {
+        if (new_frame && s->have_frame) {
+            unsigned int delta = (f->beat_phase - s->last_phase) & 0xFFFFU;
+            if (delta < 0x8000U)                     /* ignore re-syncs */
+                step = delta;
+        }
+    } else {
+        /* ~0.6 px/s when quiet up to ~3 px/s when loud. */
+        step = dt * (40U + f->loudness_fast / 2U + f->energy / 8U);
+    }
+    s->motion_q16 = (s->motion_q16 + step) % LE_MOTION_WRAP;
+
+    if (new_frame) {
+        unsigned int kick = 0U;
+        if (!s->have_frame)
+            s->onset_floor = f->onset_low;
+        if (f->onset_low > s->onset_floor + LE_ONSET_MARGIN) {
+            kick = (f->onset_low - s->onset_floor) * 2U;
+            if (kick > 255U)
+                kick = 255U;
+        }
+        if ((f->events & LE_MUSIC_EVENT_KICK) && f->onset_low > kick)
+            kick = f->onset_low;
+        if (kick > s->onset_env)
+            s->onset_env = kick;
+        s->onset_floor = (s->onset_floor * 7U + f->onset_low + 4U) / 8U;
+        s->last_seq = f->seq;
+        s->last_frame_ms = f->timestamp_ms;
+        s->last_phase = f->beat_phase & 0xFFFFU;
+        s->have_frame = 1;
+    }
 }
 
 /* ------------------------------- grammars ------------------------------- */
 
 static void le_render_ribbon(struct led_rgb out[LE_LED_PIXELS],
                              const struct le_music_features *f,
+                             const struct le_music_render_state *state,
                              struct led_rgb primary, struct led_rgb secondary,
                              unsigned int warmth)
 {
-    unsigned int width = 2U + f->loudness_fast / 70U;   /* 2..5 */
-    unsigned int center = (f->beat_phase * LE_LED_PIXELS) / 65536U;
-    unsigned int level = 30U + f->energy / 2U;          /* 30..157 */
+    unsigned int width = (2U + f->loudness_fast / 70U) * 256U;  /* 2..5 px */
+    /* Free-running unless the beat is locked, then one pixel per beat. */
+    unsigned int center = le_pos8(state->motion_q16, 0U);
+    unsigned int level = 30U + f->energy / 2U + state->onset_env / 4U;
     struct led_rgb ribbon = le_lerp(primary, secondary, warmth);
     unsigned int i;
 
+    if (level > 255U)
+        level = 255U;
     for (i = 0U; i < LE_LED_PIXELS; i++) {
-        unsigned int d = le_distance(i, center % LE_LED_PIXELS);
-        if (d <= width) {
+        unsigned int d = le_distance8(i, center);
+        if (d < width) {
             unsigned int frac = (width - d) * 255U / width;
             le_add(&out[i], ribbon, le_mul255(frac, level));
         }
@@ -80,28 +179,39 @@ static void le_render_ribbon(struct led_rgb out[LE_LED_PIXELS],
 
 static void le_render_twin_arcs(struct led_rgb out[LE_LED_PIXELS],
                                 const struct le_music_features *f,
+                                const struct le_music_render_state *state,
                                 struct led_rgb primary,
                                 struct led_rgb secondary)
 {
-    unsigned int length = 2U + f->density / 64U;        /* 2..5 */
-    unsigned int weight = 40U + f->loudness_slow / 2U;  /* 40..167 */
+    unsigned int env = state->onset_env;
+    /* Arc half-length 1.1..2 px: at most four pixels per arc, so at most
+       eight of twelve are ever lit and the ring never fills. */
+    unsigned int half = 288U + f->density / 2U + env / 4U;
+    unsigned int weight = 24U + f->loudness_fast / 2U + env * 104U / 255U;
+    unsigned int a = le_pos8(state->motion_q16, 0U);
+    unsigned int b = (a + 6U * 256U) % LE_RING8;
     unsigned int i;
 
+    if (half > 512U)
+        half = 512U;
+    if (weight > 255U)
+        weight = 255U;
     for (i = 0U; i < LE_LED_PIXELS; i++) {
-        unsigned int d0 = le_distance(i, 0U);
-        unsigned int d1 = le_distance(i, 6U);
+        unsigned int d0 = le_distance8(i, a);
+        unsigned int d1 = le_distance8(i, b);
         unsigned int d = d0 < d1 ? d0 : d1;
-        if (d < length) {
-            unsigned int frac = (length - d) * 255U / length;
+        if (d < half) {
+            unsigned int frac = (half - d) * 255U / half;
             struct led_rgb colour = (d0 <= d1) ? primary : secondary;
             le_add(&out[i], colour, le_mul255(frac, weight));
         }
     }
-    /* Sparse transient accents rather than filling the ring. */
+    /* Transient accents land on the arc heads, never on dark pixels. */
     if (f->onset_high > 120U) {
+        unsigned int head = ((a + 128U) / 256U) % LE_LED_PIXELS;
         unsigned int accent = f->onset_high;
-        le_add(&out[3U], primary, accent);
-        le_add(&out[9U], secondary, accent);
+        le_add(&out[head], primary, accent);
+        le_add(&out[(head + 6U) % LE_LED_PIXELS], secondary, accent);
     }
 }
 
@@ -198,15 +308,24 @@ static void le_render_ember(struct led_rgb out[LE_LED_PIXELS],
                             struct le_music_render_state *state,
                             struct led_rgb primary, struct led_rgb secondary)
 {
+    /* The block drifts at half the shared motion rate. */
+    unsigned int center = le_pos8(state->motion_q16 / 2U, 0U);
+    unsigned int env = state->onset_env;
+    unsigned int level = le_mul255(f->loudness_fast, 130U) + env * 90U / 255U;
     unsigned int i;
 
-    /* Bass-weighted amber/red motion with substantial black space. */
+    if (level > 220U)
+        level = 220U;
+    /* Bass-weighted amber/red motion with substantial black space: a block
+       of at most five pixels plus two opposite sparks on bass hits. */
     for (i = 0U; i < LE_LED_PIXELS; i++) {
-        int near = (i < 3U) || (i >= 10U);
-        if (near)
-            le_add(&out[i], primary, le_mul255(f->loudness_slow, 160U));
-        else if (i == 5U || i == 7U)
-            le_add(&out[i], secondary, f->onset_low / 2U);
+        unsigned int d = le_distance8(i, center);
+        if (d < 640U) {
+            unsigned int cover = d <= 384U ? 255U : (640U - d) * 255U / 256U;
+            le_add(&out[i], primary, le_mul255(cover, level));
+        } else if (d >= 1152U && d < 1408U) {
+            le_add(&out[i], secondary, env / 2U);
+        }
     }
     /* Sparse cool transient sparks. */
     if (f->transientness > 120U) {
@@ -293,6 +412,15 @@ void le_music_render(const struct le_music_scene *scene,
                      struct le_music_render_state *state,
                      struct led_rgb out[LE_LED_PIXELS])
 {
+    le_music_render_at(scene, features, state, features->timestamp_ms, out);
+}
+
+void le_music_render_at(const struct le_music_scene *scene,
+                        const struct le_music_features *features,
+                        struct le_music_render_state *state,
+                        unsigned int clock_ms,
+                        struct led_rgb out[LE_LED_PIXELS])
+{
     struct led_rgb primary;
     struct led_rgb secondary;
     struct led_rgb accent;
@@ -307,13 +435,15 @@ void le_music_render(const struct le_music_scene *scene,
     secondary = le_lerp(scene->palette.secondary,
                         scene->next_palette.secondary, blend);
     accent = le_lerp(scene->palette.accent, scene->next_palette.accent, blend);
+    le_render_advance(state, features, clock_ms);
 
     switch (scene->grammar) {
     case LE_GRAMMAR_RIBBON:
-        le_render_ribbon(out, features, primary, secondary, features->warmth);
+        le_render_ribbon(out, features, state, primary, secondary,
+                         features->warmth);
         break;
     case LE_GRAMMAR_TWIN_ARCS:
-        le_render_twin_arcs(out, features, primary, secondary);
+        le_render_twin_arcs(out, features, state, primary, secondary);
         break;
     case LE_GRAMMAR_ORBIT:
         le_render_orbit(out, features, state, primary, secondary);

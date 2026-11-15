@@ -8,6 +8,7 @@
 #define LE_BUILD_MIN           130U
 #define LE_EVENT_STRENGTH_MIN  110U
 #define LE_QUIET_GAP_FRAMES    8U
+#define LE_STALE_DWELLS        1.2
 
 static const struct {
     struct led_rgb primary;
@@ -249,9 +250,11 @@ void le_music_director_update(struct le_music_director *d,
                          f->novelty >= LE_SECTION_NOVELTY;
         int dwell_ok = d->have_scene_time &&
                        (now - d->scene_started) >= d->cfg.scene_dwell_seconds;
+        /* Refresh soon after the dwell even without structural evidence:
+           two dwells held one look for ~21 s on real music. */
         int stale = d->have_scene_time &&
                     (now - d->scene_started) >=
-                        d->cfg.scene_dwell_seconds * 2.0;
+                        d->cfg.scene_dwell_seconds * LE_STALE_DWELLS;
         int low_conf_orbit = d->grammar == LE_GRAMMAR_ORBIT &&
                              d->confidence_ema < LE_LOW_CONFIDENCE;
 

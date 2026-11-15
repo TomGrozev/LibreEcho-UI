@@ -3079,9 +3079,19 @@ static void apply_music_v2(struct daemon_context *ctx, double now)
 {
     struct le_music_scene scene;
     struct led_rgb logical[RING_PIXELS];
+    double since = now - ctx->visualizer_last_frame;
+    unsigned int clock_ms;
 
+    /* Re-renders between producer frames (~85 ms apart) extend the frame's
+       timeline so motion and onset release keep running every 33 ms. */
+    if (since < 0.0)
+        since = 0.0;
+    if (since > VISUALIZER_TIMEOUT_SECONDS)
+        since = VISUALIZER_TIMEOUT_SECONDS;
+    clock_ms = ctx->music_features.timestamp_ms + (unsigned int)(since * 1000.0);
     le_music_director_scene(&ctx->music_director, now, &scene);
-    le_music_render(&scene, &ctx->music_features, &ctx->music_render, logical);
+    le_music_render_at(&scene, &ctx->music_features, &ctx->music_render,
+                       clock_ms, logical);
     output_music_rgb(ctx, logical, ctx->music_brightness);
 }
 

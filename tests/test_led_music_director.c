@@ -269,6 +269,25 @@ int main(void)
                           "an interrupted transition must not replay");
     }
 
+    /* 11. Without structural events a segment is refreshed shortly after the
+       dwell rather than held for two dwells (~21 s observed on hardware). */
+    {
+        struct le_music_director d;
+        int changed = 0;
+        le_music_director_reset(&d, 17U, &cfg);
+        for (i = 0, t = 0.0; t < 12.5; i++, t += 0.085) {
+            f = feat();
+            f.seq = (unsigned int)(i + 1);
+            f.timestamp_ms = (unsigned int)(t * 1000.0);
+            f.beat_confidence = 40U;
+            le_music_director_update(&d, &f, t);
+            if (d.crossfading)
+                changed = 1;
+        }
+        require_condition(changed,
+                          "a steady segment must change within ~1.2 dwells");
+    }
+
     puts("music scene director: ok");
     return 0;
 }
