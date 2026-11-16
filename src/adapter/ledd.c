@@ -75,6 +75,14 @@
    dial with an empty section rather than as a few disconnected pixels. */
 #define METER_TRACK_PERCENT 6U
 #define VISUALIZER_TIMEOUT_SECONDS 0.42
+/* v1 decays and the rhythm cooldown run on elapsed time so a faster producer
+   frame rate does not speed them up.  The reference step matches the old
+   once-per-render decay (33 ms tick plus ~11.7 fps frames, ~24 ms apart);
+   the cooldown blocks the next ~11.7 fps frame as the old 2-frame counter
+   did, at any frame rate. */
+#define VISUALIZER_DECAY_STEP_MS 24.0
+#define VISUALIZER_RHYTHM_COOLDOWN_SECONDS 0.13
+#define VISUALIZER_BASS_FLOOR_SECONDS 1.28
 #define STARTUP_READY_PATH "/run/libreecho/startup-ready"
 /* Boot comet: one soft segment rolls round the ring.  The head position is
    continuous in time, so each frame blends the segment across neighbouring
@@ -277,7 +285,8 @@ struct daemon_context {
     unsigned int visualizer_impact;
     unsigned int visualizer_rhythm_step;
     unsigned int visualizer_rhythm_pulse;
-    unsigned int visualizer_rhythm_cooldown;
+    double visualizer_rhythm_ready_at;   /* rhythm trigger cooldown */
+    double visualizer_decay_at;          /* last beat/pulse/impact decay */
     /*
      * Legacy v1 major music FX is disabled (UI#65).  These stay zero because
      * the compatibility path may never select a timer- or transient-driven
@@ -773,13 +782,15 @@ static void output_render_transfer(struct daemon_context *ctx,
 }
 
 /*
- * Smoothed drive levels for every gamma-transfer frame (#364 follow-up).
+ * Smoothed drive levels for every gamma- and linear-transfer frame (#364
+ * follow-up; music frames use the linear transfer).
  *
  * The integer path rounds each channel to a whole PWM code after the gamma-2
  * transfer, so anything that fades or pulses at low brightness steps visibly
  * (a pulse at 20% red only spans a handful of codes).  When the kernel offers
  * the IS31 current scale, follow the exact gamma-2 curve in fine units
- * instead, and pick the nearest level the chip can show.  A uniform ring is
+ * (or, for linear music frames, the exact linear level) instead, and pick
+ * the nearest level the chip can show.  A uniform ring is
  * also dithered spatially between the two nearest levels, as the sleep pulse
  * does, so its average lands between them too.
  *
@@ -790,7 +801,8 @@ static void output_render_transfer(struct daemon_context *ctx,
  * code, and a lit channel never drops to black.
  */
 static double smooth_fine_target(unsigned int channel, double brightness,
-                                 unsigned int gain)
+                                 unsigned int gain,
+                                 enum led_output_transfer transfer)
 {
     double v;
 
@@ -803,6 +815,8 @@ static double smooth_fine_target(unsigned int channel, double brightness,
         v = v * (double)gain / 255.0;
     if (v > 255.0)
         v = 255.0;
+    if (transfer == LE_OUTPUT_TRANSFER_LINEAR)
+        return v * (double)FINE_UNITS;
     return v * v / 255.0 * (double)FINE_UNITS;
 }
 
@@ -844,7 +858,8 @@ static unsigned int smooth_floor_level(const struct hardware *hw,
 
 static void output_smooth_fine(struct daemon_context *ctx,
                                const struct led_rgb logical[RING_PIXELS],
-                               double brightness)
+                               double brightness,
+                               enum led_output_transfer transfer)
 {
     const struct led_output_calibration *cal = led_output_default_calibration();
     struct pixel fine[RING_PIXELS];
@@ -872,7 +887,8 @@ static void output_smooth_fine(struct daemon_context *ctx,
             unsigned int code = k == 0U ? ctx->rendered_pixels[i].r
                               : k == 1U ? ctx->rendered_pixels[i].g
                                         : ctx->rendered_pixels[i].b;
-            double target = smooth_fine_target(channel, brightness, gains[k]);
+            double target = smooth_fine_target(channel, brightness, gains[k],
+                                               transfer);
             unsigned int level;
 
             smooth_bracket(&ctx->hw, target, code * FINE_UNITS, &below, &above);
@@ -915,7 +931,7 @@ static void output_commit_level(struct daemon_context *ctx,
         brightness = 100.0;
     whole = (unsigned int)(brightness + 0.5);
     output_render_transfer(ctx, logical, whole, LE_OUTPUT_TRANSFER_GAMMA);
-    output_smooth_fine(ctx, logical, brightness);
+    output_smooth_fine(ctx, logical, brightness, LE_OUTPUT_TRANSFER_GAMMA);
     (void)output_flush(ctx, monotonic_seconds(), 0);
 }
 
@@ -940,7 +956,12 @@ static void output_commit_transfer(struct daemon_context *ctx,
         output_commit_level(ctx, logical, (double)brightness);
         return;
     }
+    /* Linear (music) frames: same fine-level route, following the exact
+       linear target instead of the gamma-2 curve. */
+    if (brightness > 100U)
+        brightness = 100U;
     output_render_transfer(ctx, logical, brightness, transfer);
+    output_smooth_fine(ctx, logical, (double)brightness, transfer);
     (void)output_flush(ctx, monotonic_seconds(), 0);
 }
 
@@ -2056,6 +2077,7 @@ static void pixel_add_scaled(struct pixel *pixel,
 }
 
 static void trigger_visualizer_rhythm(struct daemon_context *ctx,
+                                      double now,
                                       unsigned int onset,
                                       unsigned int low_delta,
                                       unsigned int mid_delta,
@@ -2064,7 +2086,7 @@ static void trigger_visualizer_rhythm(struct daemon_context *ctx,
     unsigned int pulse;
     unsigned int step = 1;
 
-    if (ctx->visualizer_rhythm_cooldown > 0 || onset < 30U)
+    if (now < ctx->visualizer_rhythm_ready_at || onset < 30U)
         return;
 
     if (high_delta > low_delta + 18U && high_delta > mid_delta)
@@ -2085,7 +2107,33 @@ static void trigger_visualizer_rhythm(struct daemon_context *ctx,
         pulse = 170U;
     if (pulse > ctx->visualizer_rhythm_pulse)
         ctx->visualizer_rhythm_pulse = pulse;
-    ctx->visualizer_rhythm_cooldown = 2U;
+    ctx->visualizer_rhythm_ready_at = now + VISUALIZER_RHYTHM_COOLDOWN_SECONDS;
+}
+
+static unsigned int visualizer_fall(unsigned int value, unsigned int per_step,
+                                    double steps)
+{
+    double fall = (double)per_step * steps + 0.5;
+
+    return (double)value > fall ? value - (unsigned int)fall : 0U;
+}
+
+/* Release beat/pulse/impact by the time elapsed since the last decay. */
+static void visualizer_decay(struct daemon_context *ctx, double now)
+{
+    double elapsed = now - ctx->visualizer_decay_at;
+    double steps;
+
+    if (elapsed <= 0.0)
+        return;
+    ctx->visualizer_decay_at = now;
+    if (elapsed > 0.5)
+        elapsed = 0.5;
+    steps = elapsed * 1000.0 / VISUALIZER_DECAY_STEP_MS;
+    ctx->visualizer_beat = visualizer_fall(ctx->visualizer_beat, 14U, steps);
+    ctx->visualizer_rhythm_pulse =
+        visualizer_fall(ctx->visualizer_rhythm_pulse, 18U, steps);
+    ctx->visualizer_impact = visualizer_fall(ctx->visualizer_impact, 12U, steps);
 }
 
 /*
@@ -2221,9 +2269,11 @@ static void apply_visualizer(struct daemon_context *ctx, double now)
     unsigned int drift;
     unsigned int average = 0;
     unsigned int base;
-    unsigned int pulse = ctx->visualizer_rhythm_pulse;
+    unsigned int pulse;
     size_t i;
 
+    visualizer_decay(ctx, now);
+    pulse = ctx->visualizer_rhythm_pulse;
     for (i = 0; i < RING_PIXELS; i++)
         average += ctx->visualizer_smoothed[i];
     average /= RING_PIXELS;
@@ -2294,8 +2344,6 @@ static void apply_visualizer(struct daemon_context *ctx, double now)
             pixels[at].g = pixels[at].g + accent / 3U > 255U
                          ? 255U : pixels[at].g + accent / 3U;
         }
-        ctx->visualizer_beat = ctx->visualizer_beat > 14U
-                             ? ctx->visualizer_beat - 14U : 0U;
     }
     if (ctx->visualizer_fx_frames > 0) {
         unsigned int total = ctx->visualizer_fx_kind == 4U ? 10U : 5U;
@@ -2337,12 +2385,6 @@ static void apply_visualizer(struct daemon_context *ctx, double now)
         if (ctx->visualizer_fx_frames == 0)
             ctx->visualizer_fx_kind = 0;
     }
-    if (ctx->visualizer_rhythm_pulse > 18U)
-        ctx->visualizer_rhythm_pulse -= 18U;
-    else
-        ctx->visualizer_rhythm_pulse = 0;
-    ctx->visualizer_impact = ctx->visualizer_impact > 12U
-                           ? ctx->visualizer_impact - 12U : 0U;
     if (ctx->music_active) {
         apply_music_v2(ctx, now);
     } else {
@@ -2363,7 +2405,7 @@ static void expire_visualizer(struct daemon_context *ctx, double now)
         ctx->visualizer_owner[0] = '\0';
         ctx->visualizer_impact = 0;
         ctx->visualizer_rhythm_pulse = 0;
-        ctx->visualizer_rhythm_cooldown = 0;
+        ctx->visualizer_rhythm_ready_at = 0.0;
         ctx->visualizer_fx_kind = 0;
         ctx->visualizer_fx_frames = 0;
         /* An expired stream releases the v2 session so a resumed producer is
@@ -2960,6 +3002,7 @@ static void start_visualizer(struct daemon_context *ctx,
     unsigned int previous_low = 0, previous_mid = 0, previous_high = 0;
     unsigned int low_delta, mid_delta, high_delta, onset;
     int first_frame = !ctx->visualizer_active;
+    double since_frame = now - ctx->visualizer_last_frame;
     size_t i;
 
     if (!ctx->visualizer_enabled)
@@ -2981,13 +3024,16 @@ static void start_visualizer(struct daemon_context *ctx,
         ctx->visualizer_impact = 0;
         ctx->visualizer_rhythm_step = 0;
         ctx->visualizer_rhythm_pulse = 0;
-        ctx->visualizer_rhythm_cooldown = 0;
+        ctx->visualizer_rhythm_ready_at = 0.0;
         ctx->visualizer_fx_kind = 0;
         ctx->visualizer_fx_frames = 0;
         ctx->visualizer_fx_phase = 0;
+        ctx->visualizer_decay_at = now;
         for (i = 0; i < RING_PIXELS; i++)
             ctx->visualizer_smoothed[i] = levels[i];
     } else {
+        /* Release earlier hits before this frame adds new ones. */
+        visualizer_decay(ctx, now);
         for (i = 0; i < RING_PIXELS; i++) {
             unsigned int previous = ctx->visualizer_smoothed[i];
             unsigned int raw_previous = ctx->visualizer_levels[i];
@@ -3036,7 +3082,7 @@ static void start_visualizer(struct daemon_context *ctx,
         high_delta = group_delta(high, previous_high);
         onset = flux + peak_jump / 3U +
                 (low_delta + mid_delta + high_delta + 1U) / 3U;
-        trigger_visualizer_rhythm(ctx, onset, low_delta, mid_delta,
+        trigger_visualizer_rhythm(ctx, now, onset, low_delta, mid_delta,
                                   high_delta);
         /*
          * No major FX transition here: legacy compatibility may not start a
@@ -3054,8 +3100,6 @@ static void start_visualizer(struct daemon_context *ctx,
             if (accent > ctx->visualizer_beat)
                 ctx->visualizer_beat = accent;
         }
-        if (ctx->visualizer_rhythm_cooldown > 0)
-            ctx->visualizer_rhythm_cooldown--;
     }
     if (bass > ctx->visualizer_bass_floor + 24U && bass > 64U) {
         unsigned int beat = (bass - ctx->visualizer_bass_floor) * 2U;
@@ -3064,8 +3108,15 @@ static void start_visualizer(struct daemon_context *ctx,
         if (beat > ctx->visualizer_beat)
             ctx->visualizer_beat = beat;
     }
-    ctx->visualizer_bass_floor =
-        (ctx->visualizer_bass_floor * 15U + bass + 8U) / 16U;
+    /* Bass floor: a 1/16 step per ~85 ms frame, by elapsed time. */
+    {
+        double a, floor = (double)ctx->visualizer_bass_floor;
+        if (first_frame || since_frame < 0.0)
+            since_frame = 0.0;
+        a = since_frame / (since_frame + VISUALIZER_BASS_FLOOR_SECONDS);
+        floor += ((double)bass - floor) * a;
+        ctx->visualizer_bass_floor = (unsigned int)(floor + 0.5);
+    }
     if (!ctx->test_active && !ctx->pattern_active)
         apply_visualizer(ctx, now);
 }
@@ -3079,9 +3130,19 @@ static void apply_music_v2(struct daemon_context *ctx, double now)
 {
     struct le_music_scene scene;
     struct led_rgb logical[RING_PIXELS];
+    double since = now - ctx->visualizer_last_frame;
+    unsigned int clock_ms;
 
+    /* Re-renders between producer frames (~85 ms apart) extend the frame's
+       timeline so motion and onset release keep running every 33 ms. */
+    if (since < 0.0)
+        since = 0.0;
+    if (since > VISUALIZER_TIMEOUT_SECONDS)
+        since = VISUALIZER_TIMEOUT_SECONDS;
+    clock_ms = ctx->music_features.timestamp_ms + (unsigned int)(since * 1000.0);
     le_music_director_scene(&ctx->music_director, now, &scene);
-    le_music_render(&scene, &ctx->music_features, &ctx->music_render, logical);
+    le_music_render_at(&scene, &ctx->music_features, &ctx->music_render,
+                       clock_ms, logical);
     output_music_rgb(ctx, logical, ctx->music_brightness);
 }
 
@@ -3118,7 +3179,7 @@ static void stop_visualizer(struct daemon_context *ctx, const char *owner,
     ctx->visualizer_owner[0] = '\0';
     ctx->visualizer_impact = 0;
     ctx->visualizer_rhythm_pulse = 0;
-    ctx->visualizer_rhythm_cooldown = 0;
+    ctx->visualizer_rhythm_ready_at = 0.0;
     ctx->visualizer_fx_kind = 0;
     ctx->visualizer_fx_frames = 0;
     ctx->music_active = 0;
@@ -3140,7 +3201,7 @@ static void set_visualizer_enabled(struct daemon_context *ctx, int enabled,
     ctx->visualizer_impact = 0;
     ctx->visualizer_rhythm_step = 0;
     ctx->visualizer_rhythm_pulse = 0;
-    ctx->visualizer_rhythm_cooldown = 0;
+    ctx->visualizer_rhythm_ready_at = 0.0;
     ctx->visualizer_fx_kind = 0;
     ctx->visualizer_fx_frames = 0;
     ctx->visualizer_fx_phase = 0;
@@ -3280,7 +3341,8 @@ static int status_json(const struct daemon_context *ctx, char *out,
         "\"sunrise\":{\"active\":%s,\"progress_percent\":%u},"
         "\"output\":{\"effective_brightness\":%u,\"frame_load\":%u,"
         "\"max_load\":%u,\"limited\":%s,\"slew_limited\":%s},"
-        "\"music\":{\"active\":%s,\"grammar\":\"%s\",\"effect\":\"%s\","
+        "\"music\":{\"active\":%s,\"grammar\":\"%s\",\"mood\":\"%s\","
+        "\"effect\":\"%s\","
         "\"session\":%u},"
         "\"boot_profile\":{\"r\":%u,\"g\":%u,\"b\":%u,\"brightness\":%u},"
         "\"profiles\":{",
@@ -3321,6 +3383,8 @@ static int status_json(const struct daemon_context *ctx, char *out,
         ctx->output_diag.slew_limited ? "true" : "false",
         ctx->music_active ? "true" : "false",
         ctx->music_active ? le_music_grammar_name(ctx->music_director.grammar)
+                          : "none",
+        ctx->music_active ? le_music_mood_name(ctx->music_director.mood)
                           : "none",
         ctx->music_active ? le_music_effect_name(ctx->music_director.effect)
                           : "none",

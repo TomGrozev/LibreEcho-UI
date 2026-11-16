@@ -47,7 +47,7 @@ static void require_condition(int condition, const char *message)
     }
 }
 
-static char last_response[1024];
+static char last_response[8192];   /* a status reply is a few kB */
 
 static void fire(struct daemon_context *ctx, const char *line)
 {
@@ -609,6 +609,74 @@ int main(void)
         unlink(scaled_file);
     }
 
+    /* ---- 5e. Music frames (linear transfer) also take the smoothed route:
+       a dim music frame lands on intermediate fine levels through the
+       scaled path, never above the whole code and never black when lit,
+       while a budget-limited frame keeps whole codes. ------------------ */
+    {
+        char scaled_file[] = "/tmp/libreecho-ledd-scaled3-XXXXXX";
+        struct led_rgb music[RING_PIXELS];
+        struct led_rgb loud[RING_PIXELS];
+        unsigned int i, b, rep, intermediate = 0U, lit = 0U;
+        int fd;
+
+        fd = mkstemp(scaled_file);
+        require_condition(fd >= 0, "create fake scaled_frame file");
+        close(fd);
+        reset(&ctx);
+        ctx.hw.kind = HW_IS31FL3236;
+        snprintf(ctx.hw.is31_scaled_path, sizeof(ctx.hw.is31_scaled_path),
+                 "%s", scaled_file);
+        for (i = 0U; i < RING_PIXELS; i++) {
+            unsigned int level = 10U + i * 50U / (RING_PIXELS - 1U);
+            music[i] = (struct led_rgb){level, level / 2U, 60U - level / 2U};
+            loud[i] = (struct led_rgb){255U, 255U, 255U};
+        }
+        for (b = 20U; b <= 30U; b += 5U) {
+            for (rep = 0U; rep < 20U; rep++)      /* let any slew settle */
+                output_music_rgb(&ctx, music, b);
+            require_condition(!ctx.output_diag.limited &&
+                                  !ctx.output_diag.slew_limited,
+                              "a dim music frame must not be budget limited");
+            for (i = 0U; i < RING_PIXELS * 3U; i++) {
+                const struct pixel *fine = &ctx.rendered_fine[i / 3U];
+                const struct pixel *code = &ctx.rendered_pixels[i / 3U];
+                unsigned int f = i % 3U == 0U ? fine->r
+                               : i % 3U == 1U ? fine->g : fine->b;
+                unsigned int c = i % 3U == 0U ? code->r
+                               : i % 3U == 1U ? code->g : code->b;
+
+                require_condition(fine_level_reachable(&ctx.hw, f),
+                                  "music asked for a level the chip lacks");
+                require_condition(f <= c * FINE_UNITS,
+                                  "music smoothing must never boost");
+                require_condition(c == 0U || f > 0U,
+                                  "music smoothing must not blank a lit channel");
+                if (c > 0U)
+                    lit++;
+                if (f % FINE_UNITS != 0U)
+                    intermediate++;
+            }
+        }
+        require_condition(lit > 0U, "the dim music frame must light the ring");
+        require_condition(intermediate >= 6U,
+                          "dim music must use intermediate fine levels");
+
+        /* A budget-limited music frame keeps whole codes. */
+        output_music_rgb(&ctx, loud, 100U);
+        require_condition(ctx.output_diag.limited || ctx.output_diag.slew_limited,
+                          "a full white music frame must hit the limits");
+        for (i = 0U; i < RING_PIXELS; i++)
+            require_condition(ctx.rendered_fine[i].r ==
+                                  ctx.rendered_pixels[i].r * FINE_UNITS &&
+                              ctx.rendered_fine[i].g ==
+                                  ctx.rendered_pixels[i].g * FINE_UNITS &&
+                              ctx.rendered_fine[i].b ==
+                                  ctx.rendered_pixels[i].b * FINE_UNITS,
+                              "a limited music frame must keep whole codes");
+        unlink(scaled_file);
+    }
+
     /* ---- 6. Sleep timer expiry selects off and returns to base. --------- */
     reset(&ctx);
     fire(&ctx, "{\"v\":1,\"id\":1,\"cmd\":\"sleep_light\",\"args\":"
@@ -790,6 +858,37 @@ int main(void)
     require_condition(ctx.music_session == 42U && ctx.music_features.seq == 1U,
                       "session and sequence must be tracked");
 
+    /* Status reports the scene and its mood, and no feature debug dump. */
+    fire(&ctx, "{\"v\":1,\"id\":1,\"cmd\":\"status\"}");
+    require_condition(response_ok(), "status must answer during music");
+    {
+        const char *music = strstr(last_response, "\"music\":{\"active\":true,");
+        const char *end = music != NULL ? strchr(music, '}') : NULL;
+        const char *mood = music != NULL ? strstr(music, "\"mood\":\"") : NULL;
+        require_condition(music != NULL && end != NULL,
+                          "status must report the active music scene");
+        require_condition(mood != NULL && mood < end,
+                          "the music status must carry the mood");
+        mood += strlen("\"mood\":\"");
+        require_condition(strncmp(mood, "calm\"", 5U) == 0 ||
+                          strncmp(mood, "balanced\"", 9U) == 0 ||
+                          strncmp(mood, "energetic\"", 10U) == 0 ||
+                          strncmp(mood, "intense\"", 8U) == 0,
+                          "the mood must be one of the four mood names");
+        require_condition(strncmp(mood, le_music_mood_name(
+                                            ctx.music_director.mood),
+                                  strlen(le_music_mood_name(
+                                             ctx.music_director.mood))) == 0,
+                          "status must report the director's mood");
+        require_condition(strstr(music, "\"grammar\":\"") != NULL &&
+                          strstr(music, "\"grammar\":\"") < end &&
+                          strstr(music, "\"session\":42") != NULL &&
+                          strstr(music, "\"session\":42") < end,
+                          "the music status must name grammar and session");
+        require_condition(strstr(last_response, "\"dbg\"") == NULL,
+                          "status must not dump raw feature frames");
+    }
+
     build_v2(frame, sizeof(frame), 1U, 1000U, 42U);   /* duplicate */
     fire(&ctx, frame);
     require_condition(strstr(last_response, "\"accepted\":false") != NULL,
@@ -816,6 +915,13 @@ int main(void)
                       "a legacy spectrum frame must still be accepted");
     require_condition(!ctx.music_active,
                       "a legacy frame must not be treated as v2 music");
+    fire(&ctx, "{\"v\":1,\"id\":1,\"cmd\":\"status\"}");
+    require_condition(strstr(last_response, "\"music\":{\"active\":false,"
+                                            "\"grammar\":\"none\","
+                                            "\"mood\":\"none\",") != NULL,
+                      "without a music scene status must report no mood");
+    require_condition(strstr(last_response, "\"dbg\"") == NULL,
+                      "status must not dump raw feature frames");
 
     /* A malformed v2 frame is rejected outright. */
     reset(&ctx);
