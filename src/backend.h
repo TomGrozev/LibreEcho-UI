@@ -29,7 +29,18 @@ struct le_audio_state { int volume, microphone_gain, notification_volume, muted,
     are display state only and never touch the master volume. */
  char noise_source[16], noise_bed[8]; int noise_tempo, noise_fade_seconds;
  /* Music volume leveling (audio engine AVL); 1 = on, the stock default. */
- int volume_leveling; };
+ int volume_leveling;
+ /* Separate assistant-reply volume (#409). reply_volume_custom 0: replies
+    follow the master and reply_volume equals volume; 1: their own level. */
+ int reply_volume, reply_volume_custom;
+ /* Mic array mixing mode for the voice stream: beamformer (default), average or single. */
+ char microphone_mix[16];
+ /* Array lane (0-6) used by the single mode; -1 is automatic (lowest selected lane). */
+ int microphone_lane;
+ /* Owner four-band equaliser (owner_eq.h): band gains in half-decibels
+    (bass, low_mid, high_mid, treble; -12..12 = -6..+6 dB) and the display
+    preset name ("" means flat). boost_db is the speaker boost: 0, 3 or 6. */
+ int eq_halves[4]; char eq_preset[16]; int boost_db; };
 /*
  * Spotify Connect. installed is 0 when the librespot-based daemon is not in
  * the image, which is different from being switched off: the UI must be able
@@ -149,6 +160,8 @@ struct le_sendspin_state {
     int installed, enabled, running;
     int listening, discoverable, connected, paired, streaming, time_synced;
     int volume, muted;
+    /* Owner's "play without pairing" choice (off by default). */
+    int unpaired_access;
     char server[64];
 };
 /* What radiod is doing. title and station are whatever the stream said about
@@ -175,6 +188,12 @@ struct le_timer_entry {
     char state[16];
     long seconds_remaining;
     char label[48];
+    /* Alarms and reminders: the repeat mask (bit 0 Sunday, zero for one-off)
+       and the local time they are set for. Hour and minute are -1 for
+       countdowns. */
+    unsigned repeat_days;
+    int hour;
+    int minute;
 };
 struct le_timer_list {
     struct le_timer_entry items[16];
@@ -188,8 +207,11 @@ void le_backend_destroy(struct le_backend *b);
 const char *le_backend_mode(struct le_backend *b);
 const char *le_result_code(int rc);
 int le_get_system_status(struct le_backend*,struct le_system_status*); int le_get_device_info(struct le_backend*,struct le_device_info*);
-int le_get_audio_state(struct le_backend*,struct le_audio_state*); int le_set_volume(struct le_backend*,int); int le_set_microphone_gain(struct le_backend*,int); int le_set_microphone_muted(struct le_backend*,int); int le_play_test_tone(struct le_backend*); int le_set_tts_voice(struct le_backend*,const char*); int le_set_volume_leveling(struct le_backend*,int); int le_announce(struct le_backend*,const char*); int le_stop_speech(struct le_backend*); int le_start_noise(struct le_backend*,const char*,int,int); int le_stop_noise(struct le_backend*); int le_simulate_audio(struct le_backend*,const char*); int le_radio_play(struct le_backend*,const char*); int le_radio_stop(struct le_backend*); int le_radio_playing(struct le_backend*,struct le_radio_status*);
+int le_get_audio_state(struct le_backend*,struct le_audio_state*); int le_set_volume(struct le_backend*,int); int le_set_microphone_gain(struct le_backend*,int); int le_set_microphone_muted(struct le_backend*,int); int le_play_test_tone(struct le_backend*); int le_set_tts_voice(struct le_backend*,const char*); int le_set_volume_leveling(struct le_backend*,int); int le_set_reply_volume(struct le_backend*,int,int); int le_set_microphone_mix(struct le_backend*,const char*); int le_set_microphone_lane(struct le_backend*,int); int le_announce(struct le_backend*,const char*); int le_stop_speech(struct le_backend*); int le_start_noise(struct le_backend*,const char*,int,int); int le_stop_noise(struct le_backend*); int le_simulate_audio(struct le_backend*,const char*); int le_radio_play(struct le_backend*,const char*); int le_radio_stop(struct le_backend*); int le_radio_playing(struct le_backend*,struct le_radio_status*); int le_set_do_not_disturb(struct le_backend*,int);
 int le_start_noise_ex(struct le_backend*,const struct le_noise_request*);
+/* Owner equaliser: preset is a canonical name from owner_eq.h ("custom"
+   included), halves the four band gains; LE_INVALID outside the rules. */
+int le_set_owner_eq(struct le_backend*,const char*preset,const int halves[4]); int le_set_speaker_boost(struct le_backend*,int db);
 int le_get_led_state(struct le_backend*,struct le_led_state*); int le_set_led_colour(struct le_backend*,uint8_t,uint8_t,uint8_t); int le_set_led_brightness(struct le_backend*,int); int le_set_led_visualizer_enabled(struct le_backend*,int); int le_set_boot_led(struct le_backend*,const struct le_led_profile*); int le_set_led_profile(struct le_backend*,const char*,const struct le_led_profile*); int le_set_led_night(struct le_backend*,int,int,int); int le_run_led_test(struct le_backend*); int le_get_spotify_state(struct le_backend*,struct le_spotify_state*); int le_set_spotify_enabled(struct le_backend*,int); int le_get_light_state(struct le_backend*,struct le_light_state*);
 /* auto_off_minutes: 0, 5, 10, 30 or 60; -1 leaves the stored value unchanged. */
 int le_set_led_idle_mode(struct le_backend*,const char*,int auto_off_minutes);
@@ -210,8 +232,10 @@ int le_get_sendspin_state(struct le_backend*,struct le_sendspin_state*); int le_
 int le_sendspin_pairing_token(struct le_backend*,char*,size_t);
 /* Forget every paired server; the player restarts with a new pairing token. */
 int le_sendspin_reset_pairing(struct le_backend*);
+/* Owner's "play without pairing" choice; the player restarts to apply it. */
+int le_set_sendspin_unpaired(struct le_backend*,int);
 int le_get_playback_state(struct le_backend*,struct le_playback_state*);
-int le_get_timers(struct le_backend*,struct le_timer_list*); int le_add_timer(struct le_backend*,int,const char*,unsigned*); int le_cancel_timer(struct le_backend*,unsigned); int le_dismiss_timers(struct le_backend*,int*);
+int le_get_timers(struct le_backend*,struct le_timer_list*); int le_add_timer(struct le_backend*,int,const char*,unsigned*); int le_cancel_timer(struct le_backend*,unsigned); int le_dismiss_timers(struct le_backend*,int*); int le_add_alarm(struct le_backend*,long long,const char*,unsigned*); int le_add_repeat_alarm(struct le_backend*,int,int,unsigned,const char*,unsigned*); int le_snooze_timers(struct le_backend*,int*); int le_add_reminder(struct le_backend*,int,int,unsigned,const char*,unsigned*); int le_get_alarm_sunrise(struct le_backend*,int*); int le_set_alarm_sunrise(struct le_backend*,int);
 int le_reboot(struct le_backend*); int le_reboot_bootloader(struct le_backend*); int le_shutdown(struct le_backend*); int le_factory_reset(struct le_backend*);
 int le_backend_tick(struct le_backend*); int le_backend_mock_control(struct le_backend*,const char*,const char*);
 

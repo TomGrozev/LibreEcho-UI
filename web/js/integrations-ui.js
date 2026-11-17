@@ -164,6 +164,7 @@ function deviceAssistantBody(a,selected) {
       ${field('Provider',a.provider_name||a.provider,'assistant-provider','text','disabled')}
       ${field('Model',a.model||'','assistant-model')}
       ${clockFormatField(a.clock_format,'assistant-clock-format')}
+      ${stopWithoutWakeField(a,'assistant-stop-without-wake')}
       <label class="field"><span>Voice response prompt</span><textarea id="assistant-prompt" rows="8">${esc(a.prompt||'')}</textarea></label>
       ${saveButton('save-assistant')}
     </div>
@@ -236,12 +237,62 @@ function bindLiveToggle(id,assistant) {
   input.onchange=()=>setLiveProvider(input.checked,assistant);
 }
 
+/* Stop without the wake word (#405). Off by default: it transcribes room audio
+   while something rings or a reply plays, on the device only. */
+function stopWithoutWakeField(a,id) {
+  return toggle('Stop without the wake word',a.stop_without_wake===true,id)+
+    '<p class="muted">While a timer or alarm rings or a reply is playing, saying just "stop" ends it. '+
+    'What the device hears in those moments is recognised on the device and dropped unless it was a stop; '+
+    'it is never sent to a speech server.</p>';
+}
+
 function clockFormatField(value,id) {
   const twelve = value !== '24';
   return `<label class="field"><span>Spoken time format</span><select id="${id}">`+
     `<option value="12" ${twelve?'selected':''}>12-hour (2:30 PM)</option>`+
     `<option value="24" ${twelve?'':'selected'}>24-hour (14:30)</option>`+
     `</select></label>`;
+}
+
+/*
+ * PUT /voice-pipeline answers 202 with restart.state "pending" while the voice
+ * daemons are stopped and started (src/api.c voice_pipeline_restart_state():
+ * pending | ready | failed). The assistant daemon is down for that window, so
+ * PUT /assistant returns 503 until it is back (#365). Wait for the restart.
+ * The init scripts can spend up to ~10 s stopping each daemon, so allow two
+ * minutes in total; the server has no restart deadline of its own.
+ */
+const PIPELINE_RESTART_POLL_MS=1000;
+const PIPELINE_RESTART_TIMEOUT_MS=120000;
+/* agentd's init start returns once the process exists, not once its socket is
+   listening, so the first assistant PUT after "ready" can still see 503. */
+const ASSISTANT_RETRY_MS=1000;
+const ASSISTANT_RETRY_ATTEMPTS=10;
+const ASSISTANT_UNAVAILABLE='Voice assistant service is unavailable';
+function integrationsSleep(ms) { return new Promise(resolve=>setTimeout(resolve,ms)); }
+
+async function waitForPipelineRestart(result) {
+  const deadline=Date.now()+PIPELINE_RESTART_TIMEOUT_MS;
+  let restart=result?.restart;
+  /* No restart object: nothing was tracked (mock backend), nothing to wait for. */
+  if(!restart)return;
+  while(restart?.state==='pending') {
+    if(Date.now()>=deadline)throw new Error('Voice pipeline restart timed out; check the Integrations page and try again');
+    await integrationsSleep(PIPELINE_RESTART_POLL_MS);
+    restart=(await api('/voice-pipeline'))?.restart;
+  }
+  if(restart?.state==='failed')throw new Error(restart.error||'Voice pipeline restart failed');
+  if(restart?.state!=='ready')throw new Error('Voice pipeline restart reported an unknown state');
+}
+
+async function putAssistantAfterRestart(body) {
+  for(let attempt=1;;attempt++) {
+    try { return await api('/assistant',{method:'PUT',body:JSON.stringify(body)}); }
+    catch(error) {
+      if(error.message!==ASSISTANT_UNAVAILABLE||attempt>=ASSISTANT_RETRY_ATTEMPTS)throw error;
+    }
+    await integrationsSleep(ASSISTANT_RETRY_MS);
+  }
 }
 
 async function setAssistantProvider(provider,enabled,pipeline,assistant) {
@@ -259,23 +310,27 @@ async function setAssistantProvider(provider,enabled,pipeline,assistant) {
       if(local) {
         await api('/privacy',{method:'PUT',body:JSON.stringify({local_only:false})});
       }
-      await api('/voice-pipeline',{method:'PUT',body:JSON.stringify({
+      await waitForPipelineRestart(await api('/voice-pipeline',{method:'PUT',body:JSON.stringify({
         mode:local?'custom':'local',
         stt_wyoming_uri:pipeline?.stt?.wyoming_uri||'',
         stt_model:pipeline?.stt?.model||'whisper-small',
         tts_wyoming_uri:pipeline?.tts?.wyoming_uri||'',
         tts_voice:pipeline?.tts?.voice||'en_GB-alan-medium'
-      })});
+      })}));
+      await putAssistantAfterRestart({provider,enabled});
+    } else {
+      await api('/assistant',{method:'PUT',body:JSON.stringify({provider,enabled})});
     }
-    await api('/assistant',{method:'PUT',body:JSON.stringify({provider,enabled})});
     if(!enabled&&provider==='openai-compatible'&&pipeline?.mode==='custom') {
-      await api('/voice-pipeline',{method:'PUT',body:JSON.stringify({
+      /* Wait here too, or the page re-renders mid-restart and briefly shows
+         the assistant as unavailable. */
+      await waitForPipelineRestart(await api('/voice-pipeline',{method:'PUT',body:JSON.stringify({
         mode:'local',
         stt_wyoming_uri:pipeline?.stt?.wyoming_uri||'',
         stt_model:pipeline?.stt?.model||'whisper-small',
         tts_wyoming_uri:pipeline?.tts?.wyoming_uri||'',
         tts_voice:pipeline?.tts?.voice||'en_GB-alan-medium'
-      })});
+      })}));
     }
     toast(enabled?(provider==='openai-compatible'?'Local LLM enabled':'On Device Voice Assistant enabled'):'Voice assistant disabled');
     await integrationsPage();
@@ -563,13 +618,13 @@ async function integrationsPage() {
         if(localEnabled) {
           await api('/privacy',{method:'PUT',body:JSON.stringify({local_only:false})});
         }
-        await api('/voice-pipeline',{method:'PUT',body:JSON.stringify({
+        await waitForPipelineRestart(await api('/voice-pipeline',{method:'PUT',body:JSON.stringify({
           mode:localEnabled?'custom':'local',
           stt_wyoming_uri:$('#stt-wyoming-uri').value.trim(),
           stt_model:$('#stt-model').value.trim(),
           tts_wyoming_uri:$('#tts-wyoming-uri').value.trim(),
           tts_voice:$('#tts-voice').value.trim()
-        })});
+        })}));
         const body={
           provider:'openai-compatible',
           enabled:localEnabled,
@@ -580,7 +635,7 @@ async function integrationsPage() {
         };
         const key=$('#local-api-key').value;
         if(key)body.api_key=key;
-        await api('/assistant',{method:'PUT',body:JSON.stringify(body)});
+        await putAssistantAfterRestart(body);
         toast('Local AI stack settings saved');
       } catch(error) {
         toast(error.message,true);
@@ -591,12 +646,13 @@ async function integrationsPage() {
     if($('#local-test'))$('#local-test').onclick=()=>post('/assistant/respond',{text:$('#local-test-text').value},'Test response queued');
 
     if(deviceSelected) {
-      bindDirty(['#assistant-model','#assistant-clock-format','#assistant-prompt'],'#save-assistant');
+      bindDirty(['#assistant-model','#assistant-clock-format','#assistant-stop-without-wake','#assistant-prompt'],'#save-assistant');
       $('#save-assistant').onclick=()=>mutate('/assistant',{
         provider:'openai-codex',
         enabled:deviceEnabled&&account.signedIn,
         model:$('#assistant-model').value.trim(),
         clock_format:$('#assistant-clock-format').value,
+        stop_without_wake:$('#assistant-stop-without-wake').checked===true,
         prompt:$('#assistant-prompt').value.trim()
       },'On Device Voice Assistant settings saved');
       if($('#assistant-test'))$('#assistant-test').onclick=()=>post('/assistant/respond',{text:$('#assistant-test-text').value},'Test response queued');
@@ -630,9 +686,22 @@ async function sendspinDetail(){
   host.innerHTML=`<div class="status-line"><span class="status-dot ${s.connected?'ok':''}"></span><span>${sendspinStateText(s)}</span></div>
     <p class="muted">Music Assistant finds this speaker on your network. To add it, pair it there with this speaker's pairing token.</p>
     <div class="button-row"><button class="secondary-btn" id="sendspin-pair">Show pairing token</button><button class="secondary-btn" id="sendspin-unpair">Forget paired servers</button></div>
+    <label class="sound-row${s.unpaired_access?' on':''}"><input type="checkbox" id="sendspin-unpaired"${s.unpaired_access?' checked':''}> Play without pairing (off)</label>
+    <p class="muted">When on, any Music Assistant server on your network can play to this speaker, including ones that have not paired. Paired servers work either way.</p>
     <div id="sendspin-token" hidden></div>`;
   $('#sendspin-pair').onclick=showSendspinToken;
   $('#sendspin-unpair').onclick=forgetSendspinServers;
+  $('#sendspin-unpaired').onchange=setSendspinUnpaired;
+}
+/* Owner's play-without-pairing switch. Turning it on is confirmed first; the
+   box is put back if the change is refused. */
+async function setSendspinUnpaired(e){
+  const box=e.target,enabled=box.checked;
+  if(enabled&&!confirm('Let Music Assistant servers play without pairing?\n\nAny server on your network can then stream audio to this speaker until you turn this off. Paired servers are not affected.')){box.checked=false;return;}
+  try{await api('/sendspin/unpaired-access',{method:'PUT',body:JSON.stringify({enabled})});}
+  catch(err){box.checked=!enabled;toast(err.message,true);return;}
+  toast(enabled?'Play without pairing is on':'Play without pairing is off');
+  await sendspinDetail();
 }
 /* Clears every pairing and issues a new token; servers must pair again. */
 async function forgetSendspinServers(){

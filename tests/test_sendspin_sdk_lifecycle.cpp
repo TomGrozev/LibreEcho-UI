@@ -77,6 +77,35 @@ int main() {
           "feedback reports only acknowledged played prefix while late CREDIT is held");
     CHECK(offer()==pcm.size()*2,"identical offer receives held credit");
     CHECK(listener.pump_feedback() && listener.reported_frames()==1024,"held tail reported after SDK acknowledges it");
+    // The engine drops the live generation under a still-open SDK stream (its PCM
+    // error path cancels it). The feedback pump re-arms a successor by itself: the
+    // SDK does not restart the stream, and audio is accepted again.
+    CHECK(session.streaming(),"recovery precondition: streaming");
+    const auto dropped=session.generation();
+    server.with_sink([&](le_audio_sink* s){ (void)le_audio_sink_cancel(s,server.epoch(),dropped); });
+    CHECK(offer()==0,"dropped generation refuses audio");
+    CHECK(!session.streaming(),"listener sees the engine drop");
+    for(int i=0;i<200 && !session.streaming();++i) {
+        listener.pump_feedback();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(session.streaming() && session.generation()>dropped,"feedback pump re-arms a successor without stream/start");
+    CHECK(offer()==pcm.size()*2,"audio resumes after the feedback re-arm");
+    // A mute change between an offer that left a DATA awaiting credit and its
+    // retry changes the bytes. That must end in a re-arm, not a dead socket under
+    // a stream that still looks open.
+    server.pause(); CHECK(offer()==0,"offer awaits credit while the engine is stalled");
+    const auto before_mute=session.generation();
+    callback.on_mute_changed(true);
+    CHECK(offer()==0,"retry with changed (muted) bytes is not credited");
+    server.resume();
+    CHECK(!session.streaming() && session.rearm_pending(),"changed retry reports a stream loss");
+    for(int i=0;i<200 && !session.streaming();++i) {
+        listener.pump_feedback();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(session.streaming() && session.generation()>before_mute,"feedback pump re-arms after a changed offer");
+    CHECK(offer()==pcm.size()*2,"audio resumes after the changed-offer re-arm");
     session.disconnect(); server.stop();
     if(g_failures) return 1;
     std::puts("test_sendspin_sdk_lifecycle: all checks passed"); return 0;
