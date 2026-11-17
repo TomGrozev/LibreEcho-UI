@@ -2,7 +2,7 @@
 # Four-band owner equaliser and speaker boost through the HTTP API (mock
 # backend): GET shape, PUT presets and bands, validation (nothing changes on a
 # 400), and the configuration export/import round trip. Leaves the device
-# flat with no boost, as it found it.
+# flat with no boost and at the volume it found.
 set -eu
 URL=${LIBREECHO_TEST_URL:-http://127.0.0.1:18082}
 OUT=${TMPDIR:-/tmp}/le-owner-eq.out
@@ -11,6 +11,8 @@ put(){ curl -fsS -X PUT "$URL/api/v1/audio" -H "$CSRF" -H 'Content-Type: applica
 code_of(){ curl -sS -o "$OUT" -w '%{http_code}' -X PUT "$URL/api/v1/audio" -H "$CSRF" -H 'Content-Type: application/json' --data "$1"; }
 state(){ curl -fsS "$URL/api/v1/audio" | jq -c '.data | {volume, eq, boost_db}'; }
 fail(){ echo "owner eq api: $*" >&2; exit 1; }
+# The server is shared with later suites: put the volume back as it was found.
+volume0=$(curl -fsS "$URL/api/v1/audio" | jq -r '.data.volume')
 
 # GET: flat, no boost, exact shape.
 curl -fsS "$URL/api/v1/audio" | jq -e '.ok and .data.eq == {"preset":"flat","bass":0,"low_mid":0,"high_mid":0,"treble":0} and .data.boost_db == 0' >/dev/null ||
@@ -84,5 +86,6 @@ legacy=$(printf '%s' "$exported" | jq -c 'del(.eq_preset, .eq_bass, .eq_low_mid,
 curl -fsS -X POST "$URL/api/v1/config/import" -H "$CSRF" -H 'Content-Type: application/json' --data "$legacy" >/dev/null
 curl -fsS "$URL/api/v1/audio" | jq -e '.data.eq.preset == "vocal" and .data.boost_db == 3' >/dev/null || fail 'legacy import'
 
-put '{"eq":{"preset":"flat"},"boost_db":0}' >/dev/null
+put "{\"volume\":$volume0,\"eq\":{\"preset\":\"flat\"},\"boost_db\":0}" >/dev/null
+[ "$(state)" = "{\"volume\":$volume0,\"eq\":{\"preset\":\"flat\",\"bass\":0,\"low_mid\":0,\"high_mid\":0,\"treble\":0},\"boost_db\":0}" ] || fail "not restored: $(state)"
 echo 'owner eq api: ok'
