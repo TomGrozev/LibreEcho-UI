@@ -36,7 +36,11 @@ struct le_audio_state { int volume, microphone_gain, notification_volume, muted,
  /* Mic array mixing mode for the voice stream: beamformer (default), average or single. */
  char microphone_mix[16];
  /* Array lane (0-6) used by the single mode; -1 is automatic (lowest selected lane). */
- int microphone_lane; };
+ int microphone_lane;
+ /* Owner four-band equaliser (owner_eq.h): band gains in half-decibels
+    (bass, low_mid, high_mid, treble; -12..12 = -6..+6 dB) and the display
+    preset name ("" means flat). boost_db is the speaker boost: 0, 3 or 6. */
+ int eq_halves[4]; char eq_preset[16]; int boost_db; };
 /*
  * Spotify Connect. installed is 0 when the librespot-based daemon is not in
  * the image, which is different from being switched off: the UI must be able
@@ -205,6 +209,9 @@ const char *le_result_code(int rc);
 int le_get_system_status(struct le_backend*,struct le_system_status*); int le_get_device_info(struct le_backend*,struct le_device_info*);
 int le_get_audio_state(struct le_backend*,struct le_audio_state*); int le_set_volume(struct le_backend*,int); int le_set_microphone_gain(struct le_backend*,int); int le_set_microphone_muted(struct le_backend*,int); int le_play_test_tone(struct le_backend*); int le_set_tts_voice(struct le_backend*,const char*); int le_set_volume_leveling(struct le_backend*,int); int le_set_reply_volume(struct le_backend*,int,int); int le_set_microphone_mix(struct le_backend*,const char*); int le_set_microphone_lane(struct le_backend*,int); int le_announce(struct le_backend*,const char*); int le_stop_speech(struct le_backend*); int le_start_noise(struct le_backend*,const char*,int,int); int le_stop_noise(struct le_backend*); int le_simulate_audio(struct le_backend*,const char*); int le_radio_play(struct le_backend*,const char*); int le_radio_stop(struct le_backend*); int le_radio_playing(struct le_backend*,struct le_radio_status*); int le_set_do_not_disturb(struct le_backend*,int);
 int le_start_noise_ex(struct le_backend*,const struct le_noise_request*);
+/* Owner equaliser: preset is a canonical name from owner_eq.h ("custom"
+   included), halves the four band gains; LE_INVALID outside the rules. */
+int le_set_owner_eq(struct le_backend*,const char*preset,const int halves[4]); int le_set_speaker_boost(struct le_backend*,int db);
 int le_get_led_state(struct le_backend*,struct le_led_state*); int le_set_led_colour(struct le_backend*,uint8_t,uint8_t,uint8_t); int le_set_led_brightness(struct le_backend*,int); int le_set_led_visualizer_enabled(struct le_backend*,int); int le_set_boot_led(struct le_backend*,const struct le_led_profile*); int le_set_led_profile(struct le_backend*,const char*,const struct le_led_profile*); int le_set_led_night(struct le_backend*,int,int,int); int le_run_led_test(struct le_backend*); int le_get_spotify_state(struct le_backend*,struct le_spotify_state*); int le_set_spotify_enabled(struct le_backend*,int); int le_get_light_state(struct le_backend*,struct le_light_state*);
 /* auto_off_minutes: 0, 5, 10, 30 or 60; -1 leaves the stored value unchanged. */
 int le_set_led_idle_mode(struct le_backend*,const char*,int auto_off_minutes);

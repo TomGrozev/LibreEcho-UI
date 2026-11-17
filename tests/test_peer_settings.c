@@ -32,6 +32,15 @@ static void test_copyable_keys(void)
     CHECK(le_settings_key_group("stt_vad_floor_rms") == LE_SETTINGS_VOICE);
     CHECK(le_settings_key_group("volume") == LE_SETTINGS_AUDIO);
     CHECK(le_settings_key_group("microphone_gain") == LE_SETTINGS_AUDIO);
+    /* Owner equaliser and speaker boost travel with the audio group. */
+    CHECK(le_settings_key_group("eq_preset") == LE_SETTINGS_AUDIO);
+    CHECK(le_settings_key_group("eq_bass") == LE_SETTINGS_AUDIO);
+    CHECK(le_settings_key_group("eq_low_mid") == LE_SETTINGS_AUDIO);
+    CHECK(le_settings_key_group("eq_high_mid") == LE_SETTINGS_AUDIO);
+    CHECK(le_settings_key_group("eq_treble") == LE_SETTINGS_AUDIO);
+    CHECK(le_settings_key_group("boost_db") == LE_SETTINGS_AUDIO);
+    CHECK(le_settings_key_group("eq") == LE_SETTINGS_NONE);
+    CHECK(le_settings_key_group("eq_mid") == LE_SETTINGS_NONE);
     CHECK(le_settings_key_group("home_assistant_url") == LE_SETTINGS_HA);
     CHECK(le_settings_key_group("led_brightness") == LE_SETTINGS_LED);
     CHECK(le_settings_key_group("led_visualizer_enabled") == LE_SETTINGS_LED);

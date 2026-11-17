@@ -503,6 +503,8 @@ render the existing unsupported state without logging an HTTP error.
     "volume_leveling": false,
     "reply_volume": 50,
     "reply_volume_custom": false,
+    "eq": { "preset": "flat", "bass": 0, "low_mid": 0, "high_mid": 0, "treble": 0 },
+    "boost_db": 0,
     "microphone_mix": "beamformer",
     "microphone_lane": -1,
     "tts_voice": "southern-female",
@@ -529,7 +531,9 @@ Update audio settings.
   "microphone_lane": -1,
   "tts_voice": "southern-female",
   "volume_leveling": true,
-  "reply_volume": 35
+  "reply_volume": 35,
+  "eq": { "preset": "vocal" },
+  "boost_db": 3
 }
 ```
 
@@ -570,6 +574,42 @@ before anything changes. Home Assistant sees the same level as the `Reply
 volume` number entity (config category, 0–100 %); setting it there sets a
 separate level. The audible effect needs a LibreEcho-Platform audio engine
 that reads `reply.volume` (0.14.6 and later); older engines ignore it.
+
+`eq` is the owner's four-band equaliser: `bass` (low shelf), `low_mid`
+(peaking, 400 Hz), `high_mid` (peaking, 2.5 kHz) and `treble` (high shelf),
+each a number from `-6` to `6` dB in steps of `0.5`, plus `preset`, one of
+`flat`, `bass_boost`, `treble_boost`, `vocal`, `loudness`, `late_night`,
+`warm` or `custom`. Any subset may be sent: bands left out keep their value.
+A named preset sets its own four values (below), and bands sent with it
+override them. The preset name is for display only; the four numbers are what
+apply. GET reports the name that matches the values: a named preset only
+while all four are exactly its own, `flat` whenever all four are `0`,
+otherwise `custom` (moving a band of a preset without naming one makes it
+`custom`).
+
+| `preset` | `bass` | `low_mid` | `high_mid` | `treble` |
+|---|---|---|---|---|
+| `flat` | 0 | 0 | 0 | 0 |
+| `bass_boost` | +5 | +1 | 0 | 0 |
+| `treble_boost` | 0 | 0 | +2 | +5 |
+| `vocal` | −2 | +1 | +4 | +1 |
+| `loudness` | +4 | −1 | +1 | +4 |
+| `late_night` | −4 | 0 | +2 | 0 |
+| `warm` | +3 | +1 | −1 | −3 |
+
+`boost_db` (`0`, `3` or `6`) is the speaker gain boost, a makeup gain ahead of
+the speaker protection, which still limits loud passages. audiod persists both
+and publishes them for the audio engine as `/run/libreecho-audio/tone.conf`
+(`schema=2` with `bass_db`, `low_mid_db`, `high_mid_db`, `treble_db`) and
+`boost.conf` (`schema=1`, `boost_db`), each written atomically and absent while
+flat / 0 dB. A band outside `-6`–`6` or off the `0.5` step, a non-number band,
+an unknown band or preset name, an `eq` that is not an object, and a
+`boost_db` other than `0`, `3` or `6` are rejected with `400` before anything
+changes. The configuration export and import carry them as `eq_preset`,
+`eq_bass`, `eq_low_mid`, `eq_high_mid`, `eq_treble` and `boost_db` (optional on
+import), and the settings copy carries the same keys in the `audio` group. The
+audible effect needs a LibreEcho-Platform audio engine that reads the schema 2
+`tone.conf` and re-reads both files while playing.
 
 **Response:** Updated audio state (same as GET).
 
@@ -1719,7 +1759,7 @@ or applied:
 | Group | Keys |
 |---|---|
 | `voice` | `wake_word`, `wake_sensitivity`, `stt_max_utterance_ms`, `stt_end_silence_ms`, `stt_vad_floor_rms` |
-| `audio` | `volume`, `microphone_gain` |
+| `audio` | `volume`, `microphone_gain`, `eq_preset`, `eq_bass`, `eq_low_mid`, `eq_high_mid`, `eq_treble`, `boost_db` |
 | `ha` | `home_assistant_url` (sent only when this device has one set) |
 | `led` | `led_brightness`, `led_visualizer_enabled`, `button_action_brightness`, `button_mute_brightness` |
 
@@ -2415,7 +2455,10 @@ authentication material, logs and media metadata are never included.
 **Response:** The configuration object is returned in the normal API envelope.
 The mock backend normally returns `partial: false` and `unsupported: []`.
 `hostname_persisted: true` distinguishes a user/config-selected hostname from
-the IDME-derived first-boot default.
+the IDME-derived first-boot default. When audio is available the export also
+holds the owner equaliser and speaker boost as `eq_preset`, `eq_bass`,
+`eq_low_mid`, `eq_high_mid`, `eq_treble` (dB, steps of 0.5) and `boost_db`;
+import accepts them optionally with the rules of `PUT /api/v1/audio`.
 
 #### POST /api/v1/config/import
 

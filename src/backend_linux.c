@@ -10,6 +10,7 @@
 #include "version.h"
 #include "factory_reset.h"
 #include "service_env.h"
+#include "owner_eq.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -1272,6 +1273,48 @@ static int network(struct le_backend *b, struct le_network_state *o)
 
 static void read_microphone_mix(struct le_audio_state *o);
 
+/* The owner equaliser and boost from audiod's status.  An older audiod
+ * reports neither: the sound is then stock (flat, 0 dB), which is also what
+ * any value that does not parse exactly falls back to. */
+static void read_owner_eq(const char *response, struct le_audio_state *o)
+{
+    const char *start = strstr(response, "\"eq\":{"), *end, *p, *q;
+    int halves[LE_EQ_BANDS], band, v;
+    char preset[LE_EQ_PRESET_MAX];
+    size_t len;
+    const char *canonical;
+
+    memset(o->eq_halves, 0, sizeof(o->eq_halves));
+    snprintf(o->eq_preset, sizeof(o->eq_preset), "flat");
+    o->boost_db = 0;
+    if (json_get_int(response, "boost_db", &v) > 0 && le_boost_valid(v))
+        o->boost_db = v;
+    if (!start)
+        return;
+    start += 5;
+    end = strchr(start, '}');
+    if (!end)
+        return;
+    len = (size_t)(end - start) + 1;
+    for (band = 0; band < LE_EQ_BANDS; band++)
+        if (le_eq_find_number(start, len, le_eq_band_name(band), &halves[band]) != 1)
+            return;
+    p = strstr(start, "\"preset\":\"");
+    if (!p || p > end)
+        return;
+    p += 10;
+    q = strchr(p, '"');
+    if (!q || q > end || (size_t)(q - p) >= sizeof(preset))
+        return;
+    memcpy(preset, p, (size_t)(q - p));
+    preset[q - p] = '\0';
+    canonical = le_eq_canonical_preset(preset, halves);
+    if (!canonical)
+        return;
+    memcpy(o->eq_halves, halves, sizeof(o->eq_halves));
+    snprintf(o->eq_preset, sizeof(o->eq_preset), "%s", canonical);
+}
+
 static int audio(struct le_backend *b, struct le_audio_state *o)
 {
     char response[LE_ADAPTER_MSG_MAX];
@@ -1294,6 +1337,7 @@ static int audio(struct le_backend *b, struct le_audio_state *o)
         json_get_int(response, "reply_volume", &v) > 0 && v >= 0 && v <= 100) {
         o->reply_volume = v; o->reply_volume_custom = 1;
     }
+    read_owner_eq(response, o);
     if (json_get_bool(response, "volume_leveling", &v) > 0) o->volume_leveling = v;
     else if (json_get_bool(response, "microphone_muted", &v) > 0) { o->muted = v; found = 1; }
     read_microphone_mix(o);
@@ -3505,6 +3549,24 @@ static int do_not_disturb(struct le_backend *b, int enabled)
     return LE_OK;
 }
 
+/* Owner equaliser and speaker boost: audiod persists them and publishes the
+ * engine's tone.conf / boost.conf. */
+static int owner_eq(struct le_backend *b, const char *preset, const int *halves)
+{
+    char args[160];
+    (void)b;
+    if (le_eq_json(args, sizeof(args), preset, halves) < 0) return LE_INVALID;
+    return adapter_json_command(LE_ADAPTER_AUDIO_SOCK, "set_tone", args);
+}
+
+static int speaker_boost(struct le_backend *b, int db)
+{
+    char args[32];
+    (void)b;
+    snprintf(args, sizeof(args), "{\"boost_db\":%d}", db);
+    return adapter_json_command(LE_ADAPTER_AUDIO_SOCK, "set_boost", args);
+}
+
 static const struct le_backend_ops ops = {
     destroy, status, device,
     audio, volume, gain, mute, tone, tts_voice, announce, stop_speech,
@@ -3533,7 +3595,8 @@ static const struct le_backend_ops ops = {
     timer_add_repeat, timer_snooze, timer_add_reminder,
     timer_sunrise_get, timer_sunrise_set,
     sendspin_set_unpaired,
-    do_not_disturb
+    do_not_disturb,
+    owner_eq, speaker_boost
 };
 
 int le_linux_create(struct le_backend *b, const char *cfg)

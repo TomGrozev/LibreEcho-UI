@@ -17,6 +17,7 @@
 #include "adapter.h"
 #include "event_sound.h"
 #include "log.h"
+#include "owner_eq.h"
 #include "sleep_generator.h"
 
 #include <errno.h>
@@ -297,6 +298,12 @@ struct audio_hw {
     int reply_volume_custom;
     int reply_volume;
     long long last_reply_check_ms;
+    /* Owner equaliser (half-dB per band) and speaker boost (0/3/6 dB),
+     * persisted; the preset name is display only. */
+    int eq_halves[LE_EQ_BANDS];
+    char eq_preset[LE_EQ_PRESET_MAX];
+    int boost_db;
+    long long last_owner_eq_check_ms;
 };
 
 struct client {
@@ -974,6 +981,30 @@ static int volume_leveling_apply(int enabled);
 #endif
 static int reply_volume_load(int *volume);
 static int reply_volume_publish(int custom, int volume);
+/* Owner equaliser (four bands) and speaker boost.  audiod owns both: the
+ * choice is persisted here (absent while flat / 0 dB) and published into the
+ * audio runtime root as tone.conf (schema 2) and boost.conf, which the engine
+ * reads while playing.  Each runtime file is absent while flat / 0 dB, so the
+ * stock sound needs no file at all.  The persisted tone file is the runtime
+ * body with a leading preset=<name> line (display only). */
+#ifndef LE_TONE_PATH
+#define LE_TONE_PATH "/data/libreecho/config/tone"
+#endif
+#ifndef LE_BOOST_PATH
+#define LE_BOOST_PATH "/data/libreecho/config/speaker-boost"
+#endif
+#ifndef LE_TONE_RUNTIME_PATH
+#define LE_TONE_RUNTIME_PATH "/run/libreecho-audio/tone.conf"
+#endif
+#ifndef LE_BOOST_RUNTIME_PATH
+#define LE_BOOST_RUNTIME_PATH "/run/libreecho-audio/boost.conf"
+#endif
+#define OWNER_FILE_MAX 256
+static void owner_tone_load(int halves[LE_EQ_BANDS], char preset[LE_EQ_PRESET_MAX]);
+static int owner_boost_load(void);
+static int owner_tone_publish(const int halves[LE_EQ_BANDS]);
+static int owner_boost_publish(int db);
+static void owner_tone_log(const int halves[LE_EQ_BANDS], const char *preset);
 /* How often the guard re-reads the mixer while idle, in milliseconds. */
 #define VOLUME_GUARD_POLL_MS 250
 
@@ -1272,6 +1303,16 @@ static void audio_init(struct audio_hw *audio, int card)
     audio->reply_volume_custom = reply_volume_load(&audio->reply_volume) == 0;
     if (reply_volume_publish(audio->reply_volume_custom, audio->reply_volume) < 0)
         le_log_warn("audiod: reply volume could not be published");
+    owner_tone_load(audio->eq_halves, audio->eq_preset);
+    audio->boost_db = owner_boost_load();
+    if (owner_tone_publish(audio->eq_halves) < 0)
+        le_log_warn("audiod: tone could not be published");
+    if (owner_boost_publish(audio->boost_db) < 0)
+        le_log_warn("audiod: speaker boost could not be published");
+    if (!le_eq_is_flat(audio->eq_halves))
+        owner_tone_log(audio->eq_halves, audio->eq_preset);
+    if (audio->boost_db)
+        le_log_info("audiod: speaker boost %d dB", audio->boost_db);
     audio->do_not_disturb = flag_file_load(LE_DND_PATH);
     (void)snprintf(audio->system_audio_bus, sizeof(audio->system_audio_bus),
                    "%s", LE_SYSTEM_AUDIO_BUS);
@@ -1456,6 +1497,194 @@ static int reply_volume_publish(int custom, int volume)
         return -1;
     }
     return 0;
+}
+
+/* Write text to path atomically (temp in the same directory, then rename).
+ * Persistent choices are fsynced 0600; runtime files are 0640 like
+ * reply.volume.  Returns 0 or -1. */
+static int owner_file_write(const char *path, const char *text, mode_t mode, int durable)
+{
+    char temp[PATH_MAX];
+    size_t length = strlen(text);
+    int fd;
+
+    if (snprintf(temp, sizeof(temp), "%s.tmp.XXXXXX", path) >= (int)sizeof(temp))
+        return -1;
+    fd = mkstemp(temp);
+    if (fd < 0)
+        return -1;
+    if (fchmod(fd, mode) < 0 || write(fd, text, length) != (ssize_t)length ||
+        (durable && fsync(fd) < 0)) {
+        close(fd);
+        unlink(temp);
+        return -1;
+    }
+    if (close(fd) < 0 || rename(temp, path) < 0) {
+        unlink(temp);
+        return -1;
+    }
+    return 0;
+}
+
+static int owner_file_remove(const char *path)
+{
+    return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
+}
+
+/* Bounded read of a small file: length, or -1 when absent/unreadable/too big. */
+static int owner_file_read(const char *path, char *text, size_t size)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    ssize_t n;
+
+    if (fd < 0)
+        return -1;
+    n = read(fd, text, size - 1);
+    if (n >= 0 && (size_t)n == size - 1) {
+        char extra;
+        if (read(fd, &extra, 1) != 0)
+            n = -1;
+    }
+    close(fd);
+    if (n < 0)
+        return -1;
+    text[n] = '\0';
+    return (int)n;
+}
+
+/* Strict parse of the persisted tone file: preset=<known name> and the four
+ * schema 2 band lines, each exactly once, nothing else.  0 or -1. */
+static int owner_tone_parse(char *text, int halves[LE_EQ_BANDS], char preset[LE_EQ_PRESET_MAX])
+{
+    static const char *const keys[LE_EQ_BANDS] = { "bass_db", "low_mid_db", "high_mid_db", "treble_db" };
+    int seen_schema = 0, seen_preset = 0, seen[LE_EQ_BANDS] = { 0 }, values[LE_EQ_BANDS] = { 0 }, k;
+    char name[LE_EQ_PRESET_MAX] = "";
+    char *line = text;
+    const char *canonical;
+
+    while (*line) {
+        char *end = strchr(line, '\n'), *value;
+        if (!end)
+            return -1;   /* every line, the last included, ends in a newline */
+        *end = '\0';
+        value = strchr(line, '=');
+        if (!value)
+            return -1;
+        *value++ = '\0';
+        if (!strcmp(line, "schema")) {
+            if (seen_schema++ || strcmp(value, "2"))
+                return -1;
+        } else if (!strcmp(line, "preset")) {
+            if (seen_preset++ || strlen(value) >= sizeof(name) || le_eq_preset_index(value) < 0)
+                return -1;
+            snprintf(name, sizeof(name), "%s", value);
+        } else {
+            for (k = 0; k < LE_EQ_BANDS && strcmp(line, keys[k]); ++k)
+                ;
+            if (k == LE_EQ_BANDS || seen[k]++ || !*value ||
+                le_eq_parse_halves(value, strlen(value), &values[k]) != strlen(value))
+                return -1;
+        }
+        line = end + 1;
+    }
+    if (!seen_schema || !seen_preset)
+        return -1;
+    for (k = 0; k < LE_EQ_BANDS; ++k)
+        if (!seen[k])
+            return -1;
+    canonical = le_eq_canonical_preset(name, values);
+    if (!canonical)
+        return -1;
+    memcpy(halves, values, sizeof(values));
+    snprintf(preset, LE_EQ_PRESET_MAX, "%s", canonical);
+    return 0;
+}
+
+/* The persisted equaliser; flat when absent or not exactly valid. */
+static void owner_tone_load(int halves[LE_EQ_BANDS], char preset[LE_EQ_PRESET_MAX])
+{
+    char text[OWNER_FILE_MAX];
+
+    if (owner_file_read(LE_TONE_PATH, text, sizeof(text)) <= 0 ||
+        owner_tone_parse(text, halves, preset) < 0) {
+        memset(halves, 0, sizeof(int) * LE_EQ_BANDS);
+        snprintf(preset, LE_EQ_PRESET_MAX, "flat");
+    }
+}
+
+/* The persisted boost in dB; 0 when absent or not exactly 0, 3 or 6. */
+static int owner_boost_load(void)
+{
+    char text[8];
+    int n = owner_file_read(LE_BOOST_PATH, text, sizeof(text));
+
+    if (n == 2 && text[1] == '\n')
+        text[1] = '\0', n = 1;
+    if (n != 1 || (text[0] != '0' && text[0] != '3' && text[0] != '6'))
+        return 0;
+    return text[0] - '0';
+}
+
+/* Persist the equaliser choice (removed while flat). */
+static int owner_tone_save(const int halves[LE_EQ_BANDS], const char *preset)
+{
+    char body[OWNER_FILE_MAX], text[OWNER_FILE_MAX];
+
+    if (le_eq_is_flat(halves))
+        return owner_file_remove(LE_TONE_PATH);
+    if (le_eq_tone_conf(body, sizeof(body), halves) < 0 ||
+        snprintf(text, sizeof(text), "preset=%s\n%s", preset, body) >= (int)sizeof(text))
+        return -1;
+    return owner_file_write(LE_TONE_PATH, text, 0600, 1);
+}
+
+static int owner_boost_save(int db)
+{
+    char text[8];
+
+    if (!db)
+        return owner_file_remove(LE_BOOST_PATH);
+    snprintf(text, sizeof(text), "%d\n", db);
+    return owner_file_write(LE_BOOST_PATH, text, 0600, 1);
+}
+
+/* Drive the engine's tone.conf: absent while flat.  0 when it matches. */
+static int owner_tone_publish(const int halves[LE_EQ_BANDS])
+{
+    char text[OWNER_FILE_MAX];
+
+    if (le_eq_is_flat(halves))
+        return owner_file_remove(LE_TONE_RUNTIME_PATH);
+    if (ensure_volume_directory() < 0 || le_eq_tone_conf(text, sizeof(text), halves) < 0)
+        return -1;
+    return owner_file_write(LE_TONE_RUNTIME_PATH, text, 0640, 0);
+}
+
+/* Drive the engine's boost.conf: absent at 0 dB.  0 when it matches. */
+static int owner_boost_publish(int db)
+{
+    char text[OWNER_FILE_MAX];
+
+    if (!db)
+        return owner_file_remove(LE_BOOST_RUNTIME_PATH);
+    if (ensure_volume_directory() < 0 || le_boost_conf(text, sizeof(text), db) < 0)
+        return -1;
+    return owner_file_write(LE_BOOST_RUNTIME_PATH, text, 0640, 0);
+}
+
+static void owner_tone_log(const int halves[LE_EQ_BANDS], const char *preset)
+{
+    char v[LE_EQ_BANDS][12];
+    int i;
+
+    if (le_eq_is_flat(halves)) {
+        le_log_info("audiod: tone flat");
+        return;
+    }
+    for (i = 0; i < LE_EQ_BANDS; i++)
+        (void)le_eq_format_db(v[i], sizeof(v[i]), halves[i], 0);
+    le_log_info("audiod: tone bass %s low_mid %s high_mid %s treble %s (%s)",
+                v[0], v[1], v[2], v[3], preset);
 }
 
 static int volume_leveling_save(int enabled)
@@ -2463,7 +2692,7 @@ static int handle_request(struct audio_hw *audio, char *message,
     unsigned long id;
     long value;
     int boolean;
-    char data[768];
+    char data[1024], eq[160];
 
     if (parse_request(message, &id, command, sizeof(command)) < 0)
         return response_error(response, response_size, 0, "malformed request");
@@ -2473,6 +2702,9 @@ static int handle_request(struct audio_hw *audio, char *message,
         refresh_state(audio);
         reap_noise(audio);
         audio->amplifier_on = amplifier_active(audio);
+        if (le_eq_json(eq, sizeof(eq), audio->eq_preset[0] ? audio->eq_preset : "flat",
+                       audio->eq_halves) < 0)
+            return response_error(response, response_size, id, "status unavailable");
         (void)snprintf(data, sizeof(data),
                        "{\"volume\":%d,\"microphone_gain\":%d,"
                        "\"notification_volume\":%d,\"muted\":%s,"
@@ -2484,7 +2716,8 @@ static int handle_request(struct audio_hw *audio, char *message,
                        "\"noise_source\":\"%s\",\"noise_bed\":\"%s\","
                        "\"noise_tempo\":%d,\"noise_fade_seconds\":%ld,"
                        "\"noise_level\":%d,\"noise_remaining_seconds\":%ld,"
-                       "\"do_not_disturb\":%s}",
+                       "\"do_not_disturb\":%s,"
+                       "\"eq\":%s,\"boost_db\":%d}",
                        audio->volume, audio->gain,
                        audio->reply_volume_custom ? audio->reply_volume
                                                   : audio->notification_volume,
@@ -2502,7 +2735,8 @@ static int handle_request(struct audio_hw *audio, char *message,
                        noise_bed_name(audio->noise_bed),
                        audio->noise_tempo, audio->noise_fade_seconds,
                        audio->noise_level, noise_remaining(audio),
-                       audio->do_not_disturb ? "true" : "false");
+                       audio->do_not_disturb ? "true" : "false",
+                       eq, audio->boost_db);
         return response_ok(response, response_size, id, data);
     }
     if (!strcmp(command, "airplay_volume") || !strcmp(command, "airplay_end")) {
@@ -2691,6 +2925,61 @@ static int handle_request(struct audio_hw *audio, char *message,
             le_log_info("audiod: reply volume %d", (int)value);
         else
             le_log_info("audiod: reply volume follows the master");
+        return response_ok(response, response_size, id, "{}");
+    }
+    if (!strcmp(command, "set_tone")) {
+        /* {"bass":..,"low_mid":..,"high_mid":..,"treble":..,"preset":"<name>"}:
+         * all four bands (-6..6 dB, 0.5 dB steps) are required; the preset is
+         * display only and falls back to "custom" when it does not match. */
+        int halves[LE_EQ_BANDS], previous[LE_EQ_BANDS], band, found;
+        char requested[LE_EQ_PRESET_MAX] = "custom", previous_preset[LE_EQ_PRESET_MAX];
+        const char *canonical;
+        size_t length = strlen(message);
+
+        for (band = 0; band < LE_EQ_BANDS; ++band) {
+            found = le_eq_find_number(message, length, le_eq_band_name(band), &halves[band]);
+            if (found != 1)
+                return response_error(response, response_size, id,
+                                      "bass, low_mid, high_mid and treble must be -6 to 6 dB in 0.5 dB steps");
+        }
+        if (json_value(message, "preset") &&
+            json_string(message, "preset", requested, sizeof(requested)) < 0)
+            return response_error(response, response_size, id, "unknown preset");
+        canonical = le_eq_canonical_preset(requested, halves);
+        if (!canonical)
+            return response_error(response, response_size, id, "unknown preset");
+        memcpy(previous, audio->eq_halves, sizeof(previous));
+        snprintf(previous_preset, sizeof(previous_preset), "%s", audio->eq_preset);
+        if (owner_tone_save(halves, canonical) < 0)
+            return response_error(response, response_size, id, "tone could not be saved");
+        if (owner_tone_publish(halves) < 0) {
+            (void)owner_tone_save(previous, previous_preset[0] ? previous_preset : "flat");
+            (void)owner_tone_publish(previous);
+            return response_error(response, response_size, id, "tone could not be applied");
+        }
+        memcpy(audio->eq_halves, halves, sizeof(halves));
+        snprintf(audio->eq_preset, sizeof(audio->eq_preset), "%s", canonical);
+        owner_tone_log(halves, canonical);
+        return response_ok(response, response_size, id, "{}");
+    }
+    if (!strcmp(command, "set_boost")) {
+        /* {"boost_db":0|3|6}: makeup gain ahead of the speaker protection. */
+        int previous = audio->boost_db;
+        if (json_long(message, "boost_db", &value) < 0 || value < 0 || value > 6 ||
+            !le_boost_valid((int)value))
+            return response_error(response, response_size, id, "boost_db must be 0, 3 or 6");
+        if (owner_boost_save((int)value) < 0)
+            return response_error(response, response_size, id, "speaker boost could not be saved");
+        if (owner_boost_publish((int)value) < 0) {
+            (void)owner_boost_save(previous);
+            (void)owner_boost_publish(previous);
+            return response_error(response, response_size, id, "speaker boost could not be applied");
+        }
+        audio->boost_db = (int)value;
+        if (value)
+            le_log_info("audiod: speaker boost %d dB", (int)value);
+        else
+            le_log_info("audiod: speaker boost off");
         return response_ok(response, response_size, id, "{}");
     }
     if (!strcmp(command, "set_mute")) {
@@ -3127,6 +3416,35 @@ static void reply_volume_reconcile(struct audio_hw *audio, long long now_ms)
         le_log_info("audiod: reply volume re-published");
 }
 
+/* Keep tone.conf and boost.conf in step with the owner's choice, like
+ * reply.volume: a cleared /run or a stray edit is corrected at the poll
+ * cadence.  Rewritten only when the bytes differ, so the engine's
+ * mtime/size watch sees no change while they match. */
+static void owner_eq_reconcile(struct audio_hw *audio, long long now_ms)
+{
+    char current[OWNER_FILE_MAX], expected[OWNER_FILE_MAX];
+    int n;
+
+    if (now_ms <= 0 || (audio->last_owner_eq_check_ms != 0 &&
+        now_ms - audio->last_owner_eq_check_ms < VOLUME_GUARD_POLL_MS))
+        return;
+    audio->last_owner_eq_check_ms = now_ms;
+    n = owner_file_read(LE_TONE_RUNTIME_PATH, current, sizeof(current));
+    if (le_eq_is_flat(audio->eq_halves) ? n >= 0 || access(LE_TONE_RUNTIME_PATH, F_OK) == 0
+        : (le_eq_tone_conf(expected, sizeof(expected), audio->eq_halves) < 0 || n < 0 ||
+           strcmp(current, expected) != 0)) {
+        if (owner_tone_publish(audio->eq_halves) == 0)
+            le_log_info("audiod: tone re-published");
+    }
+    n = owner_file_read(LE_BOOST_RUNTIME_PATH, current, sizeof(current));
+    if (!audio->boost_db ? n >= 0 || access(LE_BOOST_RUNTIME_PATH, F_OK) == 0
+        : (le_boost_conf(expected, sizeof(expected), audio->boost_db) < 0 || n < 0 ||
+           strcmp(current, expected) != 0)) {
+        if (owner_boost_publish(audio->boost_db) == 0)
+            le_log_info("audiod: speaker boost re-published");
+    }
+}
+
 static void retry_startup_volume(struct audio_hw *audio, long long now_ms)
 {
     if (!audio->volume_publish_pending || audio->airplay_restore_pending ||
@@ -3228,6 +3546,7 @@ int main(int argc, char **argv)
         retry_startup_volume(&audio, monotonic_millis());
         volume_leveling_reconcile(&audio, monotonic_millis());
         reply_volume_reconcile(&audio, monotonic_millis());
+        owner_eq_reconcile(&audio, monotonic_millis());
 
         pollfds[0].fd = listen_fd;
         pollfds[0].events = POLLIN;

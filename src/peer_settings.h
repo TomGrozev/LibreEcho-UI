@@ -24,7 +24,7 @@
 enum le_settings_group {
     LE_SETTINGS_NONE = 0,
     LE_SETTINGS_VOICE = 1u << 0, /* wake word, its sensitivity, speech end and VAD tuning */
-    LE_SETTINGS_AUDIO = 1u << 1, /* speaker volume and microphone gain */
+    LE_SETTINGS_AUDIO = 1u << 1, /* speaker volume, microphone gain, equaliser and speaker boost */
     LE_SETTINGS_HA = 1u << 2,    /* Home Assistant address */
     LE_SETTINGS_LED = 1u << 3    /* LED brightness, visualizer, action and mute ring brightness */
 };

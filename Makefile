@@ -873,7 +873,7 @@ $(BUILD)/test-wyoming-protocol: tests/test_wyoming_protocol.c \
 test-wyoming-protocol: $(BUILD)/test-wyoming-protocol
 	./$(BUILD)/test-wyoming-protocol
 
-$(BUILD)/test-audiod-review: tests/test_audiod_review.c \
+$(BUILD)/test-audiod-review: tests/test_audiod_review.c src/owner_eq.h \
 		src/adapter/audiod.c src/adapter/adapter_client.c \
 		src/adapter/adapter_server.c src/log.c
 	$(CC) -D_POSIX_C_SOURCE=200809L $(CSTD) $(WARN) -Werror -Isrc -Isrc/adapter $< \
