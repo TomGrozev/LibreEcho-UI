@@ -75,7 +75,9 @@ class PeerSettings(unittest.TestCase):
 
     def test_copy_moves_only_the_chosen_groups(self):
         a, b, _ = self.paired_pair()
-        a.ok('PUT', '/api/v1/audio', {'volume': 33, 'microphone_gain': 44})
+        a.ok('PUT', '/api/v1/audio', {'volume': 33, 'microphone_gain': 44,
+                                      'eq': {'preset': 'custom', 'bass': 2.5, 'low_mid': -1, 'high_mid': 0, 'treble': 3},
+                                      'boost_db': 6})
         a.ok('PUT', '/api/v1/led', {'brightness': 35, 'visualizer_enabled': False})
         a.ok('PUT', '/api/v1/wake-word', {'sensitivity': 71})
         a.ok('PUT', '/api/v1/home-assistant', {'url': 'http://ha.example:8123'})
@@ -85,6 +87,8 @@ class PeerSettings(unittest.TestCase):
         self.assertEqual((sent['result'], sent['groups']), ('applied', 'audio,led'))
         after = self.export(b)
         self.assertEqual((after['volume'], after['microphone_gain']), (33, 44))
+        self.assertEqual([after[k] for k in ('eq_preset', 'eq_bass', 'eq_low_mid', 'eq_high_mid', 'eq_treble', 'boost_db')],
+                         ['custom', 2.5, -1, 0, 3, 6])
         self.assertEqual((after['led_brightness'], after['led_visualizer_enabled']), (35, False))
         self.assertEqual(after['wake_sensitivity'], before['wake_sensitivity'])
         self.assertEqual(after.get('home_assistant_url'), before.get('home_assistant_url'))
@@ -119,6 +123,16 @@ class PeerSettings(unittest.TestCase):
         self.assertEqual(status, 400, body)
         status, body = self.raw_post(b, seal(code, b'{"led_visualizer_enabled":"yes"}', ts, '3' * 32))
         self.assertEqual(status, 400, body)
+        for n, bad in enumerate((b'{"volume":20,"eq_bass":7}', b'{"volume":20,"eq_treble":0.25}',
+                                 b'{"volume":20,"eq_preset":"rock"}', b'{"volume":20,"boost_db":4}',
+                                 b'{"volume":20,"boost_db":3.5}')):
+            status, body = self.raw_post(b, seal(code, bad, ts, f'{5 + n:x}' * 32))
+            self.assertEqual(status, 400, (bad, body))
+        status, body = self.raw_post(b, seal(code, b'{"eq_preset":"vocal","boost_db":3}', ts, 'e' * 32))
+        self.assertEqual((status, body['data']), (200, {'applied': True}), body)
+        after = self.export(b)
+        self.assertEqual([after[k] for k in ('eq_preset', 'eq_bass', 'eq_low_mid', 'eq_high_mid', 'eq_treble', 'boost_db')],
+                         ['vocal', -2, 1, 4, 1, 3])
         self.assertEqual(self.export(b)['volume'], 12)
 
         status, body = self.raw_post(b, seal(code, b'{"volume":40}', ts - 3600, '4' * 32))

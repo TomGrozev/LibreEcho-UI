@@ -1,4 +1,5 @@
 #include "backend_internal.h"
+#include "owner_eq.h"
 #include <stdlib.h>
 #include <string.h>
 int le_backend_init(struct le_backend **out,const char *mode,const char *mock,const char *cfg,unsigned seed){struct le_backend*b;if(!out)return LE_INVALID;b=calloc(1,sizeof(*b));if(!b)return LE_IO;strncpy(b->mode,mode?mode:"mock",15);if((!strcmp(b->mode,"mock")?le_mock_create(b,mock,cfg,seed):!strcmp(b->mode,"linux")?le_linux_create(b,cfg):LE_INVALID)!=LE_OK){free(b);return LE_INVALID;}*out=b;return LE_OK;}
@@ -31,4 +32,6 @@ int le_recovery_configure(struct le_backend*b,int e,int a,int t){return b&&b->op
 int le_recovery_prepare(struct le_backend*b,char*out,size_t n){return b&&b->ops->recovery_prepare?b->ops->recovery_prepare(b,out,n):LE_NOT_SUPPORTED;}
 int le_recovery_stop(struct le_backend*b){return b&&b->ops->recovery_stop?b->ops->recovery_stop(b):LE_NOT_SUPPORTED;}
 int le_get_alarm_sunrise(struct le_backend*b,int*m){return b&&b->ops->timer_sunrise_get?b->ops->timer_sunrise_get(b,m):LE_NOT_SUPPORTED;} int le_set_alarm_sunrise(struct le_backend*b,int m){return b&&b->ops->timer_sunrise_set?b->ops->timer_sunrise_set(b,m):LE_NOT_SUPPORTED;}
+int le_set_owner_eq(struct le_backend*b,const char*preset,const int halves[4]){const char*canonical;if(!halves||!le_eq_valid_halves(halves))return LE_INVALID;canonical=le_eq_canonical_preset(preset,halves);if(!canonical)return LE_INVALID;return b&&b->ops->owner_eq?b->ops->owner_eq(b,canonical,halves):LE_NOT_SUPPORTED;}
+int le_set_speaker_boost(struct le_backend*b,int db){if(!le_boost_valid(db))return LE_INVALID;return b&&b->ops->speaker_boost?b->ops->speaker_boost(b,db):LE_NOT_SUPPORTED;}
 int le_set_do_not_disturb(struct le_backend*b,int enabled){return b&&b->ops->do_not_disturb?b->ops->do_not_disturb(b,enabled):LE_NOT_SUPPORTED;}

@@ -235,6 +235,7 @@ node tests/test_chatgpt_auth_gate_ui.js
 node tests/test_home_location_lookup_ui.js
 node tests/test_mute_lamp_ui.js
 node tests/test_reply_volume_ui.js
+node tests/test_eq_ui.js
 node tests/test_noise_suppression_ui.js
 node tests/test_doa_ui.js
 python3 tests/test_issue_34.py
@@ -509,6 +510,7 @@ LIBREECHO_TEST_URL="$URL" sh tests/test_kernel_log_stream.sh
 LIBREECHO_TEST_URL="$URL" sh tests/test_auth_navigation.sh
 LIBREECHO_TEST_URL="$URL" sh tests/test_diagnostics_export.sh
 LIBREECHO_TEST_URL="$URL" LIBREECHO_TEST_CONFIG="$CFG" sh tests/test_config.sh
+LIBREECHO_TEST_URL="$URL" sh tests/test_owner_eq_api.sh
 LIBREECHO_TEST_URL="$URL" LIBREECHO_TEST_CONFIG="$CFG" sh tests/test_voice_pipeline_ha_transitions.sh
 # Starts its own isolated mock server with the readiness overrides, so it does
 # not depend on the shared server above.
