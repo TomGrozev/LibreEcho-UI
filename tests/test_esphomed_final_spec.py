@@ -12,6 +12,8 @@ if not os.environ.get('ESPHOMED_PRIVATE_NAMESPACE') or list(Path('/sys').iterdir
 class FinalSpec(unittest.TestCase):
     setUp=NativeLifecycle.setUp
     tearDown=NativeLifecycle.tearDown
+    daemon_args=NativeLifecycle.daemon_args
+    daemon_env=NativeLifecycle.daemon_env
     connect=NativeLifecycle.connect
     hello=NativeLifecycle.hello
     owner=NativeLifecycle.owner

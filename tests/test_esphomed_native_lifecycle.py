@@ -27,6 +27,8 @@ class NativeLifecycle(unittest.TestCase):
     # Reuse fixture plumbing, not its unrelated/inherited test methods.
     setUp = fixture.Fixture.setUp
     tearDown = fixture.Fixture.tearDown
+    daemon_args = fixture.Fixture.daemon_args
+    daemon_env = fixture.Fixture.daemon_env
     connect = fixture.Fixture.connect
     hello = fixture.Fixture.hello
     http_audio = fixture.Fixture.http_audio

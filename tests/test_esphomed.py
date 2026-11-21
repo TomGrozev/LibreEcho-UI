@@ -109,13 +109,15 @@ class Daemon(unittest.TestCase):
   self.privacy=self.p/'privacy';self.privacy.write_text('0\n');self.audio_dir=self.p/(getattr(self,'audio_subdir',''));self.audio_dir.mkdir(exist_ok=True);self.bus=self.audio_dir/'system.pcm';os.mkfifo(self.bus);self.busfd=os.open(self.bus,os.O_RDONLY|os.O_NONBLOCK);self.busbytes=bytearray()
   self.adapters={k:Adapter(self.p/(k+'.sock'),k) for k in ('audio','wake','radio','timer','led','agent')}
   s=socket.socket();s.bind(('127.0.0.1',0));self.port=s.getsockname()[1];s.close();self.clients=[]
-  cmd=[BIN,'--port',str(self.port),'--bind','127.0.0.1']+(['--plaintext'] if getattr(self,'plaintext',True) else [])+['--config',str(self.config),'--status-file',str(self.p/'status.json'),'--privacy-state',str(self.privacy),'--audio-bus',str(self.bus),'--mdns-socket',str(self.p/'missing-mdns')]
+  cmd=[BIN,'--port',str(self.port),'--bind','127.0.0.1']+(['--plaintext'] if getattr(self,'plaintext',True) else [])+['--config',str(self.config),'--status-file',str(self.p/'status.json'),'--privacy-state',str(self.privacy),'--audio-bus',str(self.bus),'--mdns-socket',str(self.p/'missing-mdns'),'--idme-root',str(self.p/'missing-idme')]
   for k in self.adapters:cmd+=['--'+k+'-socket',str(self.p/(k+'.sock'))]
-  cmd+=getattr(self,'extra_args',[]);self.proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE);end=time.monotonic()+3
+  cmd+=self.daemon_args()+getattr(self,'extra_args',[]);self.proc=subprocess.Popen(cmd,env=dict(os.environ,**self.daemon_env()),stdout=subprocess.PIPE,stderr=subprocess.PIPE);end=time.monotonic()+3
   while time.monotonic()<end:
    try:self.s=self.connect();break
    except ConnectionRefusedError:time.sleep(.01)
   else:self.fail(self.proc.communicate(timeout=1))
+ def daemon_args(self):return []
+ def daemon_env(self):return {}
  def connect(self):
   s=socket.create_connection(('127.0.0.1',self.port),1);s.settimeout(3);self.clients.append(s);return s
  def sound(self):
@@ -640,4 +642,38 @@ class DuckServerWakeStartsOnHaWake(DuckCase):
   self.assertEqual(self.busbytes,bytearray(),'the continuous server-wake stream must not duck')
   self.s.sendall(frame(92,num(1,10)))
   self.assertTrue(self.feed_started(),'HA reporting the wake word must start the duck')
+# Lidar's idme has no usable MAC (mac_addr is "0"), so identity falls back to
+# wlan0's factory address; a configured or idme MAC still takes precedence.
+IDENTITY_BASE={'hostname':'fixture-satellite','ha_protocol':'esphome','voice_assistant_mode':1,'esphome_noise_key':''}
+class WlanFactoryIdentity(Daemon):
+ config_fields=IDENTITY_BASE
+ def daemon_env(self):
+  self.wlan=self.p/'wlan0-address';self.wlan.write_text('a4:5e:60:12:34:56\n')
+  return {'LE_WLAN_MAC_PATH':str(self.wlan)}
+ def test_fallback_mac_is_identity(self):
+  self.hello();self.s.sendall(frame(9));t,b=receive(self.s);self.assertEqual(t,10);self.assertIn(text(3,'a4:5e:60:12:34:56'),b)
+class IdmeMacBeatsWlan(WlanFactoryIdentity):
+ def daemon_args(self):
+  d=self.p/'idme'/'wifi_mac_addr';d.mkdir(parents=True);(d/'value').write_text('00:11:22:33:44:55\n')
+  return ['--idme-root',str(self.p/'idme')]
+ def test_fallback_mac_is_identity(self):
+  self.hello();self.s.sendall(frame(9));t,b=receive(self.s);self.assertEqual(t,10);self.assertIn(text(3,'00:11:22:33:44:55'),b);self.assertNotIn(text(3,'a4:5e:60:12:34:56'),b)
+class WlanFactoryRejected(unittest.TestCase):
+ # A locally administered or group address is not a board identity.
+ def setUp(self):
+  self.assertTrue(os.access(BIN,os.X_OK), 'daemon executable is missing')
+  self.tmp=tempfile.TemporaryDirectory(prefix='esphomed-mac-',dir=os.environ.get('TMPDIR'));self.p=pathlib.Path(self.tmp.name)
+  self.config=self.p/'config.json';self.config.write_text(json.dumps(IDENTITY_BASE))
+  self.wlan=self.p/'wlan0-address';(self.p/'privacy').write_text('0\n')
+ def tearDown(self):self.tmp.cleanup()
+ def test_local_group_and_malformed_addresses_are_refused(self):
+  for mac in ('02:00:00:00:00:01','03:00:00:00:00:01','a4:5e:60:12:34:zz','01:00:00:00:00:00'):
+   self.wlan.write_text(mac+'\n')
+   proc=subprocess.run([BIN,'--port','60530','--config',str(self.config),'--privacy-state',str(self.p/'privacy'),'--idme-root',str(self.p/'missing-idme')],env=dict(os.environ,LE_WLAN_MAC_PATH=str(self.wlan)),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=10)
+   self.assertEqual(proc.returncode,1,(mac,proc.stderr))
+   self.assertIn(b'invalid config or missing stable MAC',proc.stderr)
+ def test_missing_wlan_address_is_refused(self):
+  os.unlink(self.wlan) if self.wlan.exists() else None
+  proc=subprocess.run([BIN,'--config',str(self.config),'--privacy-state',str(self.p/'privacy'),'--idme-root',str(self.p/'missing-idme')],env=dict(os.environ,LE_WLAN_MAC_PATH=str(self.wlan)),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=10)
+  self.assertEqual(proc.returncode,1,proc.stderr)
 if __name__=='__main__':unittest.main()

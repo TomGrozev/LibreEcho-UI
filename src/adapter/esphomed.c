@@ -792,6 +792,21 @@ static void light_poll(void){static const char *const probe[]={"/sys/bus/i2c/dev
  S.lux_sent=lux;S.light_sent_at=S.now;for(unsigned i=0;i<CLIENTS;i++)if(S.clients[i].fd>=0&&S.clients[i].states&&S.clients[i].light)light_state(&S.clients[i]);}
 static void privacy_poll(void){char b[32];int n=config_read(S.privacy_path,b,sizeof b),old=S.privacy;if(n<0)S.privacy=-1;else if(b[0]=='0')S.privacy=0;else if(b[0]=='1')S.privacy=1;else S.privacy=-1;if(old!=S.privacy){if(mic_muted()&&(S.turn==1||S.turn==2))stop_capture("privacy");all_states();}}
 static int normalize_mac(const char *input,char *out){unsigned char b[6];unsigned n=0,high=0;int hi=-1;for(size_t i=0;input[i];i++){int x=input[i];if(x==':'||isspace((unsigned char)x))continue;if(x>='0'&&x<='9')x-='0';else if(x>='a'&&x<='f')x=x-'a'+10;else if(x>='A'&&x<='F')x=x-'A'+10;else return -1;if(hi<0)hi=x;else{if(n>=6)return -1;b[n++]=(unsigned char)(hi*16+x);high|=b[n-1];hi=-1;}}if(n!=6||hi>=0||!high||(b[0]&1))return -1;snprintf(out,18,"%02x:%02x:%02x:%02x:%02x:%02x",b[0],b[1],b[2],b[3],b[4],b[5]);return 0;}
+/* The board MAC normally comes from idme, but Lidar's idme carries only
+ * mac_addr = "0" and none of the other spellings, so identity has no stable
+ * value there.  wlan0's address is programmed by the vendor driver from the
+ * factory calibration and survives reboots, so it is the last resort.  Accept
+ * it only as a universally administered unicast address: an interface the
+ * driver gave a locally administered address, or a group address, does not
+ * identify the board. */
+static int wlan_mac(char *out){
+ const char *path=getenv("LE_WLAN_MAC_PATH");char raw[64];int hi,lo;
+ if(!path||!path[0])path="/sys/class/net/wlan0/address";
+ if(config_read(path,raw,sizeof raw)<=0||normalize_mac(raw,out))return -1;
+ hi=isdigit((unsigned char)out[0])?out[0]-'0':out[0]-'a'+10;
+ lo=isdigit((unsigned char)out[1])?out[1]-'0':out[1]-'a'+10;
+ return ((hi<<4)|lo)&3?-1:0;
+}
 static int load_configuration(void){char b[16384],key[45],mac[64],name[64],wake[64];int n=config_read(S.config_path,b,sizeof b);struct le_esphome_config cfg;size_t z;if(n<0||config_esphome_read(S.config_path,&cfg))return -1;
  /* The selection file is the model truth: waked and the init script read it.
   * A staged model that vanished falls back to stock and drops the stale file,
@@ -841,7 +856,7 @@ static int load_configuration(void){char b[16384],key[45],mac[64],name[64],wake[
  if(!S.friendly[0])snprintf(S.friendly,sizeof S.friendly,"%s",S.name);
  {int on=0,was=S.noise_suppression;S.noise_suppression=json_get_top_level_bool(b,(size_t)n,"voice_noise_suppression",&on)==1&&on;if(S.noise_suppression&&!was)le_voice_ns_reset(&S.ns);if(S.noise_suppression!=was)fprintf(stderr,"esphomed: noise suppression %s\n",S.noise_suppression?"on":"off");}
  {char room[64];S.room[0]=0;if(json_get_string(b,"room",room,sizeof room)==1&&strlen(room)<=48){size_t i;for(i=0;room[i]&&(unsigned char)room[i]>=0x20&&room[i]!=0x7f&&room[i]!='"'&&room[i]!='\\';i++){}if(!room[i]&&i<sizeof S.room)memcpy(S.room,room,i+1);}}
- if(!S.mac[0]){if(json_get_string(b,"wifi_mac",mac,sizeof mac)>0&&mac[0]){if(normalize_mac(mac,S.mac))return -1;}else{static const char *fields[]={"mac_addr","macaddr","wifi_mac","wifi_mac_addr","mac"};int found=0;for(unsigned i=0;i<5;i++){char path[512];if(snprintf(path,sizeof path,"%s/%s/value",S.idme_path,fields[i])>=(int)sizeof path)return -1;if(config_read(path,mac,sizeof mac)>0&&!normalize_mac(mac,S.mac)){found=1;break;}}if(!found)return -1;}}
+ if(!S.mac[0]){if(json_get_string(b,"wifi_mac",mac,sizeof mac)>0&&mac[0]){if(normalize_mac(mac,S.mac))return -1;}else{static const char *fields[]={"mac_addr","macaddr","wifi_mac","wifi_mac_addr","mac"};int found=0;for(unsigned i=0;i<5;i++){char path[512];if(snprintf(path,sizeof path,"%s/%s/value",S.idme_path,fields[i])>=(int)sizeof path)return -1;if(config_read(path,mac,sizeof mac)>0&&!normalize_mac(mac,S.mac)){found=1;break;}}if(!found&&wlan_mac(S.mac))return -1;}}
  return 0;
 }
 static void mdns_tick(unsigned port){if(!S.ha_selected){if(S.mdns_fd>=0){close(S.mdns_fd);S.mdns_fd=-1;}return;}if(S.mdns_fd>=0){if(le_mdns_receive(S.mdns_fd)<0){close(S.mdns_fd);S.mdns_fd=-1;S.mdns_retry=S.now+1000;}return;}if(S.now<S.mdns_retry)return;struct le_mdns_esphome_metadata m;memset(&m,0,sizeof m);snprintf(m.version,sizeof m.version,"2026.9.0");snprintf(m.mac,sizeof m.mac,"%s",S.mac);snprintf(m.platform,sizeof m.platform,"LibreEcho");snprintf(m.board,sizeof m.board,"radar-puffin");snprintf(m.network,sizeof m.network,"wifi");snprintf(m.friendly_name,sizeof m.friendly_name,"%s",S.friendly);snprintf(m.api_encryption,sizeof m.api_encryption,"%s",LE_MDNS_ESPHOME_NOISE);snprintf(m.project_name,sizeof m.project_name,"libreecho.satellite");snprintf(m.project_version,sizeof m.project_version,"0.14.0");S.mdns_fd=le_mdns_register_esphome(S.mdns_path,port,&m);S.mdns_retry=S.now+1000;}
