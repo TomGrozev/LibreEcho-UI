@@ -123,6 +123,13 @@ make build/test-bt-adv-proxy
 ./build/test-bt-adv-proxy
 make build/test-esphome-ble-proxy
 ./build/test-esphome-ble-proxy
+cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
+    -Isrc -Isrc/adapter tests/test_bluetooth_discoverable_order.c \
+    src/adapter/bt_mgmt_events.c src/adapter/bt_pairing_events.c \
+    src/adapter/bt_adv_proxy.c \
+    src/adapter/adapter_client.c src/adapter/adapter_server.c src/log.c \
+    -o build/test-bluetooth-discoverable-order
+./build/test-bluetooth-discoverable-order
 make build/test-sdp-wire-format
 ./build/test-sdp-wire-format
 make build/test-avdtp-wire-format

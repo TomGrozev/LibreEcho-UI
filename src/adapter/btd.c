@@ -269,6 +269,9 @@ struct bt_context {
     int pairing_saved_connectable;
     int pairing_saved_discoverable;
     int pairing_saved_bondable;
+    /* Standalone discoverable enables connectable implicitly so the kernel
+     * accepts the request; remember it to undo it on disable. */
+    int discoverable_auto_connectable;
     int audio_sink_uuid_published;
     uint8_t discovery_type;
     unsigned int supported_settings;
@@ -2431,9 +2434,6 @@ static int handle_request(struct bt_context *context, char *message,
     }
     if (!strcmp(command, "set_connectable") || !strcmp(command, "set_discoverable")) {
         int enabled;
-        uint8_t payload[3];
-        uint16_t opcode = !strcmp(command, "set_connectable") ?
-                          MGMT_OP_SET_CONNECTABLE : MGMT_OP_SET_DISCOVERABLE;
         if (json_integer(args, "enabled", &enabled) != 0) {
             const char *p = json_value(args, "enabled");
             if (!p || (strncmp(p, "true", 4) && strncmp(p, "false", 5)))
@@ -2444,13 +2444,48 @@ static int handle_request(struct bt_context *context, char *message,
         if (enabled != 0 && enabled != 1)
             return le_adapter_respond_err(response, response_size, id,
                                            "enabled must be 0 or 1");
-        memset(payload, 0, sizeof(payload));
-        payload[0] = enabled ? 1 : 0;
-        if (controller_command(context, opcode, payload,
-                               opcode == MGMT_OP_SET_DISCOVERABLE ?
-                               sizeof(payload) : 1) != 0)
+        if (!strcmp(command, "set_discoverable")) {
+            int connectable =
+                (context->current_settings & MGMT_SETTING_CONNECTABLE) != 0;
+            /* The kernel clears discoverable whenever connectable is off, so
+             * a non-connectable controller is already not discoverable and
+             * the disable request needs no controller command. */
+            if (!enabled && !connectable)
+                return le_adapter_respond_ok(response, response_size, id,
+                                             "{\"changed\":false}");
+            /* The kernel rejects discoverable while the controller is not
+             * connectable, including the disable request.  Enable connectable
+             * first and restore the previous state afterwards, in the order
+             * pairing mode already uses. */
+            if (!connectable &&
+                set_controller_setting(context, MGMT_OP_SET_CONNECTABLE, 1) != 0)
+                return le_adapter_respond_err(response, response_size, id,
+                                               "Bluetooth controller setting failed");
+            if (set_controller_setting(context, MGMT_OP_SET_DISCOVERABLE, enabled) != 0) {
+                if (!connectable)
+                    (void)set_controller_setting(context, MGMT_OP_SET_CONNECTABLE, 0);
+                return le_adapter_respond_err(response, response_size, id,
+                                               "Bluetooth controller setting failed");
+            }
+            if (!enabled) {
+                if (context->discoverable_auto_connectable) {
+                    context->discoverable_auto_connectable = 0;
+                    if (set_controller_setting(context, MGMT_OP_SET_CONNECTABLE, 0) != 0)
+                        return le_adapter_respond_err(response, response_size, id,
+                                                       "Bluetooth controller setting failed");
+                }
+            } else if (!connectable) {
+                context->discoverable_auto_connectable = 1;
+            }
+            return le_adapter_respond_ok(response, response_size, id,
+                                         "{\"changed\":true}");
+        }
+        if (set_controller_setting(context, MGMT_OP_SET_CONNECTABLE, enabled) != 0)
             return le_adapter_respond_err(response, response_size, id,
                                            "Bluetooth controller setting failed");
+        context->discoverable_auto_connectable = 0;
+        if (!enabled)
+            context->current_settings &= ~MGMT_SETTING_DISCOVERABLE;
         return le_adapter_respond_ok(response, response_size, id,
                                      "{\"changed\":true}");
     }
@@ -2576,7 +2611,6 @@ int main(int argc, char **argv)
         int profile_count = 0;
         int profile_base = 2;
         int total;
-        int i;
 
         pollfds[0].fd = listener;
         pollfds[0].events = POLLIN;
