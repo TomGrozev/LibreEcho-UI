@@ -30,6 +30,7 @@ struct options {
     const char *config;
     const char *persistent_config;
     const char *status;
+    const char *epoch_file;
     const char *rtc_device;
     const char *rtc_sysfs_dev;
     const char *route_file;
@@ -187,6 +188,84 @@ static int ensure_rtc_node(const char *device, const char *sysfs_dev)
     return stat(device, &st) == 0;
 }
 
+static int read_epoch_file(const char *path, time_t *epoch)
+{
+    FILE *file;
+    char line[64], *end;
+    long long value;
+
+    if (!path || !path[0] || !(file = fopen(path, "r")))
+        return 0;
+    if (!fgets(line, sizeof(line), file)) {
+        fclose(file);
+        return 0;
+    }
+    fclose(file);
+    errno = 0;
+    value = strtoll(line, &end, 10);
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')
+        end++;
+    if (errno || end == line || *end || value < VALID_CLOCK_EPOCH)
+        return 0;
+    *epoch = (time_t)value;
+    return 1;
+}
+
+static int persist_epoch(const char *path, time_t epoch)
+{
+    char temporary[600], body[32];
+    int fd, n;
+    ssize_t written;
+
+    if (!path || !path[0] || epoch < VALID_CLOCK_EPOCH)
+        return 0;
+    if (ensure_parent(path))
+        return -1;
+    n = snprintf(body, sizeof(body), "%ld\n", (long)epoch);
+    if (n < 0 || (size_t)n >= sizeof(body))
+        return -1;
+    n = snprintf(temporary, sizeof(temporary), "%s.tmp.%ld",
+                 path, (long)getpid());
+    if (n < 0 || (size_t)n >= sizeof(temporary))
+        return -1;
+    fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    written = write(fd, body, strlen(body));
+    if (written != (ssize_t)strlen(body) || fsync(fd)) {
+        close(fd);
+        unlink(temporary);
+        return -1;
+    }
+    if (close(fd) || rename(temporary, path)) {
+        unlink(temporary);
+        return -1;
+    }
+    return 0;
+}
+
+static int restore_persisted_clock(const struct options *options,
+                                   long *epoch_out)
+{
+    struct timespec wall;
+    time_t epoch;
+
+    if (!read_epoch_file(options->epoch_file, &epoch))
+        return 0;
+    wall.tv_sec = epoch;
+    wall.tv_nsec = 0;
+    if (clock_settime(CLOCK_REALTIME, &wall) != 0) {
+        le_log_warn("persisted wall clock could not be restored: %s",
+                    strerror(errno));
+        return 0;
+    }
+    if (epoch_out)
+        *epoch_out = (long)epoch;
+    le_log_info("wall clock restored from %s (epoch %ld)",
+                options->epoch_file, (long)epoch);
+    return 1;
+}
+
 static void peers_csv(char *output, size_t size,
                       char peers[MAX_PEERS][MAX_PEER_LEN + 1], int count)
 {
@@ -307,7 +386,12 @@ static int sync_hook(const struct options *options)
                                     options->rtc_sysfs_dev);
     rtc_persisted = rtc_available &&
                     run_hwclock(options->hwclock, options->rtc_device);
-    if (rtc_persisted)
+    /* Only a board without an RTC (Lidar) needs the epoch in userdata; with an
+     * RTC the clock survives a reboot there and nothing reads this file. */
+    if (!rtc_available && persist_epoch(options->epoch_file, (time_t)now))
+        le_log_warn("wall clock could not be persisted to %s",
+                    options->epoch_file);
+    if (!rtc_available || rtc_persisted)
         (void)unsetenv("LIBREECHO_TIME_ERROR");
     else
         (void)setenv("LIBREECHO_TIME_ERROR", "RTC persistence failed", 1);
@@ -317,8 +401,9 @@ static int sync_hook(const struct options *options)
                      servers ? servers : ""))
         return 1;
     le_log_info("NTP synchronized; RTC persistence %s",
-                rtc_persisted ? "succeeded" : "failed");
-    return rtc_persisted ? 0 : 1;
+                rtc_persisted ? "succeeded" :
+                rtc_available ? "failed" : "not available");
+    return rtc_persisted || !rtc_available ? 0 : 1;
 }
 
 static pid_t start_ntpd(const struct options *options,
@@ -431,6 +516,7 @@ static void usage(const char *name)
             "Usage: %s [--foreground] [--one-shot] [--sync-hook]\\n"
             "  [--ntpd PATH] [--hwclock PATH] [--config PATH]\\n"
             "  [--persistent-config PATH] [--status PATH]\\n"
+            "  [--epoch-file PATH]\\n"
             "  [--rtc-device PATH] [--rtc-sysfs-dev PATH]\\n"
             "  [--network-ready-file PATH] [--retry-seconds N]\\n"
             "  [--ntpd-timeout-seconds N]\\n", name);
@@ -457,6 +543,8 @@ static int parse_options(int argc, char **argv, struct options *options)
             VALUE(); options->persistent_config = argv[i];
         } else if (!strcmp(argv[i], "--status")) {
             VALUE(); options->status = argv[i];
+        } else if (!strcmp(argv[i], "--epoch-file")) {
+            VALUE(); options->epoch_file = argv[i];
         } else if (!strcmp(argv[i], "--rtc-device")) {
             VALUE(); options->rtc_device = argv[i];
         } else if (!strcmp(argv[i], "--rtc-sysfs-dev")) {
@@ -493,12 +581,15 @@ int main(int argc, char **argv)
     struct options options = {
         "/bin/ntpd", "/bin/hwclock", "/etc/libreecho/ntp.conf",
         "/data/libreecho/config/ntp.conf",
-        "/run/libreecho/time.status", "/dev/rtc0",
+        "/run/libreecho/time.status",
+        "/data/libreecho/config/time-epoch", "/dev/rtc0",
         "/sys/class/rtc/rtc0/dev", "/proc/net/route", "/etc/resolv.conf",
         NULL, 30, 30, 0, 0
     };
     char peers[MAX_PEERS][MAX_PEER_LEN + 1], servers[1100];
     const char *config_source = "image";
+    const char *clock_source;
+    long last_sync_epoch = 0;
     int count, status, rtc_available;
     int output_fd = -1;
     int hook_result;
@@ -509,6 +600,8 @@ int main(int argc, char **argv)
     le_log_init("timed", argc, argv);
     if ((environment = getenv("LIBREECHO_TIME_STATUS")))
         options.status = environment;
+    if ((environment = getenv("LIBREECHO_TIME_EPOCH")))
+        options.epoch_file = environment;
     if ((environment = getenv("LIBREECHO_TIME_RTC_DEVICE")))
         options.rtc_device = environment;
     if ((environment = getenv("LIBREECHO_TIME_RTC_SYSFS_DEV")))
@@ -531,9 +624,16 @@ int main(int argc, char **argv)
     peers_csv(servers, sizeof(servers), peers, count);
     rtc_available = ensure_rtc_node(options.rtc_device,
                                     options.rtc_sysfs_dev);
-    (void)write_status(options.status, "waiting-network",
-                       clock_valid() ? "rtc" : "unset", 0,
-                       rtc_available, 0, 0, config_source, servers);
+    if (rtc_available)
+        clock_source = clock_valid() ? "rtc" : "unset";
+    else if (!clock_valid() &&
+             restore_persisted_clock(&options, &last_sync_epoch))
+        clock_source = "persisted";
+    else
+        clock_source = clock_valid() ? "system-clock" : "unset";
+    (void)write_status(options.status, "waiting-network", clock_source, 0,
+                       rtc_available, 0, last_sync_epoch, config_source,
+                       servers);
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     signal(SIGALRM, on_alarm);
@@ -545,6 +645,7 @@ int main(int argc, char **argv)
         if (stopping)
             break;
         (void)setenv("LIBREECHO_TIME_STATUS", options.status, 1);
+        (void)setenv("LIBREECHO_TIME_EPOCH", options.epoch_file, 1);
         (void)setenv("LIBREECHO_TIME_RTC_DEVICE", options.rtc_device, 1);
         (void)setenv("LIBREECHO_TIME_RTC_SYSFS_DEV",
                      options.rtc_sysfs_dev, 1);
@@ -553,7 +654,7 @@ int main(int argc, char **argv)
         (void)setenv("LIBREECHO_TIME_SERVERS", servers, 1);
         (void)setenv("LIBREECHO_TIME_CONFIG_SOURCE", config_source, 1);
         (void)write_status(options.status, "synchronizing",
-                           clock_valid() ? "rtc" : "unset", 0,
+                           clock_source, 0,
                            rtc_available, 0, 0, config_source, servers);
         pid = start_ntpd(&options, peers, count, &output_fd);
         if (pid < 0) {
@@ -611,14 +712,14 @@ int main(int argc, char **argv)
         } else if (options.one_shot) {
             int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
             (void)write_status(options.status, "failed",
-                               clock_valid() ? "rtc" : "unset", 0,
+                               clock_source, 0,
                                rtc_available, 0, 0, config_source, servers);
             return exit_code;
         }
         le_log_warn("ntpd exited; retrying in %d seconds",
                     options.retry_seconds);
         (void)write_status(options.status, "retrying",
-                           clock_valid() ? "rtc" : "unset", 0,
+                           clock_source, 0,
                            rtc_available, 0, 0, config_source, servers);
         sleep((unsigned int)options.retry_seconds);
     }

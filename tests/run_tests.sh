@@ -464,6 +464,10 @@ cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
     -o build/test-ttsd
 ./build/test-ttsd
 sh tests/test_timed.sh
+cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
+    -Isrc -Isrc/adapter tests/test_timed_epoch.c src/log.c \
+    -o build/test-timed-epoch
+./build/test-timed-epoch
 # GPT-Live: preroll ring indexing, the session state machine driven by the mock
 # transport, the delegation allow-list, and the whole daemon end-to-end against
 # a stand-in waked.

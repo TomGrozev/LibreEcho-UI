@@ -34,6 +34,7 @@ EOF
 chmod 0755 "$root/ntpd"
 
 export LIBREECHO_TEST_HWCLOCK_LOG="$root/hwclock.log"
+export LIBREECHO_TIME_EPOCH="$root/time-epoch"
 ./build/libreecho-timed \
     --one-shot \
     --ntpd "$root/ntpd" \
@@ -54,6 +55,28 @@ grep -qx 'rtc_persisted=1' "$root/time.status"
 grep -qx 'config_source=image' "$root/time.status"
 grep -qx 'servers=time.cloudflare.com,time.nist.gov,ntp1.npl.co.uk,ntp2.npl.co.uk' "$root/time.status"
 grep -qx -- "-u -w -f $root/rtc0" "$root/hwclock.log"
+
+# Lidar has no RTC.  A missing RTC is the expected state, not an error, and
+# the wall clock still has to survive a reboot through userdata.
+./build/libreecho-timed \
+    --one-shot \
+    --ntpd "$root/ntpd" \
+    --hwclock "$root/hwclock" \
+    --config "$root/ntp.conf" \
+    --persistent-config "$root/missing-persistent.conf" \
+    --status "$root/no-rtc.status" \
+    --rtc-device "$root/missing-rtc0" \
+    --rtc-sysfs-dev "$root/missing-sysfs-dev" \
+    --epoch-file "$root/no-rtc-epoch" \
+    --network-ready-file "$root/network-ready"
+grep -qx 'state=synchronized' "$root/no-rtc.status"
+grep -qx 'source=ntp' "$root/no-rtc.status"
+grep -qx 'synchronized=1' "$root/no-rtc.status"
+grep -qx 'rtc_available=0' "$root/no-rtc.status"
+grep -qx 'rtc_persisted=0' "$root/no-rtc.status"
+grep -qx 'last_error=' "$root/no-rtc.status"
+no_rtc_epoch=$(cat "$root/no-rtc-epoch")
+[ "$no_rtc_epoch" -ge 1577836800 ]
 
 cat >"$root/ntpd-failure" <<'EOF'
 #!/bin/sh
