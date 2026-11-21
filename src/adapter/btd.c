@@ -13,6 +13,7 @@
 
 #include "adapter.h"
 #include "log.h"
+#include "image_target.h"
 
 #include "bt_adv_proxy.h"
 #include "bt_mgmt_events.h"
@@ -260,6 +261,9 @@ struct bt_pairing {
 };
 
 struct bt_context {
+    /* Lidar's MT7668 is the mainline btmtksdio driver; /dev/stpwmt exists on
+     * every target, so the image identity, not the node, picks the transport. */
+    int mainline_hci;
     int activation_attempted;
     int enabled;
     int capability_ready;
@@ -503,6 +507,13 @@ static int wmt_present(void)
 static int hci_present(void)
 {
     return access(HCI_DEVICE, F_OK) == 0;
+}
+
+static int transport_ready(struct bt_context *context)
+{
+    if (context->mainline_hci)
+        return hci_present();
+    return wmt_present() && access(BT_DEVICE, F_OK) == 0 && hci_present();
 }
 
 static void set_controller_ready(int ready)
@@ -1690,8 +1701,7 @@ static int status_json(struct bt_context *context, char *data, size_t size)
         (void)refresh_info(context);
     refresh_connected_rssi(context);
     json_escape(context->local_name, local_name, sizeof(local_name));
-    available = wmt_present() && access(BT_DEVICE, F_OK) == 0 &&
-                hci_present() && context->mgmt_fd >= 0;
+    available = transport_ready(context) && context->mgmt_fd >= 0;
     if (context->profiles_opened) {
         sdp = le_profile_registered_sdp(&context->profiles);
         a2dp = le_profile_registered_a2dp_sink(&context->profiles);
@@ -1710,7 +1720,7 @@ static int status_json(struct bt_context *context, char *data, size_t size)
     if (append_text(data, size, &used,
                     "{\"state\":\"%s\",\"available\":%s,"
                     "\"enabled\":%s,\"activation_attempted\":%s,"
-                    "\"transport\":\"mt8163-btif-hci\",\"hci\":\"%s\","
+                    "\"transport\":\"%s\",\"hci\":\"%s\","
                     "\"last_error\":\"%s\","
                     "\"last_disconnect_reason\":\"%s\","
                     "\"last_connect_failed_status\":\"%s\","
@@ -1727,6 +1737,8 @@ static int status_json(struct bt_context *context, char *data, size_t size)
                     available ? "ready" : "unavailable",
                     available ? "true" : "false", context->enabled ? "true" : "false",
                     context->activation_attempted ? "true" : "false",
+                    context->mainline_hci ? "mainline-btmtksdio-hci" :
+                                            "mt8163-btif-hci",
                     context->enabled ? "hci0" : "none", context->last_error,
                     context->last_disconnect_reason,
                     context->last_connect_failed_status,
@@ -2129,9 +2141,9 @@ static int handle_request(struct bt_context *context, char *message,
             return le_adapter_respond_ok(response, response_size, id,
                                          "{\"enabled\":false}");
         }
-        if (!wmt_present())
+        if (!transport_ready(context))
             return le_adapter_respond_err(response, response_size, id,
-                                           "MT8163 WMT device is unavailable");
+                                           "Bluetooth controller is unavailable");
         if (context->enabled) {
             uint8_t io_capability = MGMT_IO_CAP_DISPLAY_YES_NO;
 
@@ -2172,18 +2184,24 @@ static int handle_request(struct bt_context *context, char *message,
                                            "activation already attempted; reboot before retry");
         context->activation_attempted = 1;
         le_log_info("btd: explicit Bluetooth activation requested");
-        if (run_helper(CONFIGURE_HELPER, "wmt_configure", configure) != 0) {
-            snprintf(context->last_error, sizeof(context->last_error),
-                     "wmt_configure failed");
-            return le_adapter_respond_err(response, response_size, id,
-                                           context->last_error);
+        if (!context->mainline_hci) {
+            if (run_helper(CONFIGURE_HELPER, "wmt_configure", configure) != 0) {
+                snprintf(context->last_error, sizeof(context->last_error),
+                         "wmt_configure failed");
+                return le_adapter_respond_err(response, response_size, id,
+                                               context->last_error);
+            }
+            if (run_helper(BT_ON_HELPER, "wmt_bt_on", bt_on) != 0) {
+                snprintf(context->last_error, sizeof(context->last_error),
+                         "wmt_bt_on failed");
+                return le_adapter_respond_err(response, response_size, id,
+                                               context->last_error);
+            }
         }
-        if (run_helper(BT_ON_HELPER, "wmt_bt_on", bt_on) != 0) {
-            snprintf(context->last_error, sizeof(context->last_error),
-                     "wmt_bt_on failed");
-            return le_adapter_respond_err(response, response_size, id,
-                                           context->last_error);
-        }
+        /* On the mainline btmtksdio controller the driver has already
+         * downloaded firmware and registered hci0, so the MGMT SET_POWERED
+         * command below is the whole bring-up.  The helpers are never run
+         * there: their WMT staging does not exist on that target. */
         /* WMT has prepared BTIF; the supported Linux 6.1 management
          * SET_POWERED command performs the HCI open transition.  Do not use
          * the obsolete HCIDEVUP ioctl here: this target's HCI raw socket does
@@ -2521,6 +2539,21 @@ static void drain_mgmt(struct bt_context *context)
     } while (count > 0);
 }
 
+static int bring_up_mainline(struct bt_context *context)
+{
+    /* btmtksdio registers hci0 powered down but needs no staged activation,
+     * so power it here instead of waiting for the UI to ask.  A failure leaves
+     * the explicit enable path available. */
+    if (context->enabled || !context->mainline_hci || !hci_present())
+        return 0;
+    if (set_powered(context, 1) != 0 || wait_for_controller_info(context) != 0) {
+        le_log_warn("btd: mainline controller power-on failed");
+        return -1;
+    }
+    context->activation_attempted = 1;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *socket_path = DEFAULT_SOCKET;
@@ -2531,6 +2564,7 @@ int main(int argc, char **argv)
     le_log_init("btd", argc, argv);
     memset(&context, 0, sizeof(context));
     context.mgmt_fd = -1;
+    context.mainline_hci = le_image_target_is("lidar");
     load_devices(&context);
     load_keys(&context);
     for (i = 1; i < argc; ++i) {
@@ -2559,6 +2593,7 @@ int main(int argc, char **argv)
     }
     if (access(HCI_DEVICE, F_OK) == 0 && refresh_info(&context) != 0)
         le_log_warn("btd: controller not ready; activation remains available");
+    (void)bring_up_mainline(&context);
     if (context.enabled && !context.capability_ready) {
         uint8_t io_capability = MGMT_IO_CAP_DISPLAY_YES_NO;
 
