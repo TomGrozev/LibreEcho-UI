@@ -1186,9 +1186,21 @@ int main(int argc, char **argv)
 
         if (child_changed || stream_worker > 0) {
             int child_status;
-            pid_t result = waitpid(stream_worker, &child_status, WNOHANG);
+            pid_t result = 0;
+
             child_changed = 0;
-            if (result == stream_worker) {
+            /*
+             * -1 means "any child" to waitpid and "no worker" here, so the
+             * old unconditional call waited on whatever else had exited:
+             * configuring the capture path forks and reaps tinymix, and a
+             * SIGCHLD from one of those made waitpid return -1 (ECHILD),
+             * which compared equal to the sentinel and logged a false
+             * "raw microphone stream stopped" at every boot.  Ask only
+             * about a worker that actually exists.
+             */
+            if (stream_worker > 0)
+                result = waitpid(stream_worker, &child_status, WNOHANG);
+            if (stream_worker > 0 && result == stream_worker) {
                 /* A worker that died mid-write must not leave stale beams. */
                 if (beam_view) {
                     beam_view->running = 0;
