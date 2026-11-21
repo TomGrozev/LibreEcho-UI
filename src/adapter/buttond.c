@@ -1479,7 +1479,15 @@ static void handle_key(struct context *ctx, int code, int value)
      * keypad matrix and mediatek,mt8163-keypad has no driver here. Its
      * events are dispatched to action_key() above, release included.
      */
+    /*
+     * KEY_MICMUTE belongs here too: on Lidar the mute key drives the
+     * same kernel privacy latch that sync_privacy_state already follows.
+     * Toggling software mute independently made the two handlers fight: the
+     * poll asserted mute while the key released it, and the key's last word
+     * arrived after the latch dropped, leaving the capture switch off.
+     */
     case KEY_MUTE:
+    case KEY_MICMUTE:
     case KEY_POWER:
         if (value == 1) {
             int state;
@@ -1488,12 +1496,6 @@ static void handle_key(struct context *ctx, int code, int value)
                 (void)sync_privacy_state(ctx);
             else
                 toggle_mute(ctx);
-        }
-        return;
-    case KEY_MICMUTE:
-        if (value == 1) {
-            (void)refresh_audio(ctx);
-            toggle_mute(ctx);
         }
         return;              /* mute does not repeat while held */
     default:

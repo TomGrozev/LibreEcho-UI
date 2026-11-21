@@ -414,6 +414,17 @@ int main(void)
     write_state(BUTTOND_PRIVACY_STATE_PATH, 0);
     sync_privacy_state(&ctx);
 
+    /* KEY_MICMUTE follows the same latch and never toggles on its own. */
+    write_state(BUTTOND_PRIVACY_STATE_PATH, 1);
+    sync_privacy_state(&ctx);
+    before = log_count(audio_log, "\"cmd\":\"set_mute\"");
+    handle_key(&ctx, KEY_MICMUTE, 1);
+    assert(ctx.muted == 1);
+    assert(log_count(audio_log, "\"cmd\":\"set_mute\"") == before);
+    write_state(BUTTOND_PRIVACY_STATE_PATH, 0);
+    sync_privacy_state(&ctx);
+    assert(ctx.muted == 0);
+
     /* Unchanged hardware zero never clears a separate API/software mute. */
     ctx.muted = 1;
     sync_privacy_state(&ctx);
