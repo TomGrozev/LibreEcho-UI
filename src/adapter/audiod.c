@@ -16,6 +16,7 @@
 
 #include "adapter.h"
 #include "event_sound.h"
+#include "audio_profile.h"
 #include "log.h"
 #include "owner_eq.h"
 #include "sleep_generator.h"
@@ -213,6 +214,9 @@ static volatile sig_atomic_t g_sleep_stop;
 /* Raised by SIGTERM in a sample child: finish on a faded chunk and exit. */
 static volatile sig_atomic_t g_sample_stop;
 
+static struct le_audio_profile audio_profile;
+static int audio_profile_lidar;
+
 struct audio_control {
     int found;
     int writable;
@@ -232,6 +236,7 @@ struct audio_hw {
     struct audio_control capture;
     struct audio_control capture_switch;
     struct audio_control amplifier_switch;
+    struct audio_control output_route;
     int have_card_info;
     int output_available;
     int volume;
@@ -757,6 +762,17 @@ static int enumerate_controls(struct audio_hw *audio)
             continue;
         if (info.type == SNDRV_CTL_ELEM_TYPE_ENUMERATED &&
             !strcmp((const char *)ids[i].name, "Ext_Speaker_Amp_Switch")) {
+            select_control(&audio->amplifier_switch, &ids[i], &info);
+            continue;
+        }
+        if (audio_profile_lidar &&
+            info.type == SNDRV_CTL_ELEM_TYPE_ENUMERATED &&
+            !strcmp((const char *)ids[i].name, "Output Route")) {
+            select_control(&audio->output_route, &ids[i], &info);
+            continue;
+        }
+        if (audio_profile_lidar &&
+            !strcmp((const char *)ids[i].name, "LO DAC Playback Switch")) {
             select_control(&audio->amplifier_switch, &ids[i], &info);
             continue;
         }
@@ -1317,9 +1333,10 @@ static void audio_init(struct audio_hw *audio, int card)
     (void)snprintf(audio->system_audio_bus, sizeof(audio->system_audio_bus),
                    "%s", LE_SYSTEM_AUDIO_BUS);
     (void)snprintf(audio->ctl_path, sizeof(audio->ctl_path),
-                   "/dev/snd/controlC%d", card);
+                   "/dev/snd/controlC%d", audio_profile.playback_card);
     (void)snprintf(audio->pcm_path, sizeof(audio->pcm_path),
-                   "/dev/snd/pcmC%dD23p", card);
+                   "/dev/snd/pcmC%dD%dp", audio_profile.playback_card,
+                   audio_profile.playback_device);
 
     audio->ctl_fd = open(audio->ctl_path, O_RDWR | O_CLOEXEC);
     if (audio->ctl_fd < 0)
@@ -1332,6 +1349,16 @@ static void audio_init(struct audio_hw *audio, int card)
         return;
     audio->have_card_info = 1;
     (void)enumerate_controls(audio);
+    if (audio_profile_lidar) {
+        /*
+         * The AIC32x4 has no standalone speaker-enable pin exposed here:
+         * selecting the machine driver's Speaker route programs the biquads,
+         * mono mix and amplifier together.  Setting it once at startup lets
+         * the engine own only the DAC mute switch.
+         */
+        if (run_amixer(audio, "Output Route", "Speaker") < 0)
+            le_log_warn("audiod: Lidar Output Route=Speaker refused");
+    }
     refresh_state(audio);
     audio->amplifier_on = 0;
     /* Select without publishing: a pending AirPlay tombstone must be loaded
@@ -3459,7 +3486,9 @@ int main(int argc, char **argv)
 {
     const char *socket_path = LE_DEFAULT_SOCKET;
     const char *system_bus = LE_SYSTEM_AUDIO_BUS;
+    const char *profile_path = NULL;
     int card = 0;
+    int card_set = 0;
     int foreground = 0;
     int listen_fd;
     int i;
@@ -3483,6 +3512,9 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             card = (int)parsed;
+            card_set = 1;
+        } else if (!strcmp(argv[i], "--profile") && i + 1 < argc) {
+            profile_path = argv[++i];
         } else if (!strcmp(argv[i], "--system-bus") && i + 1 < argc) {
             system_bus = argv[++i];
         } else if (!strcmp(argv[i], "--foreground")) {
@@ -3496,6 +3528,16 @@ int main(int argc, char **argv)
         }
     }
     (void)foreground; /* daemonization is intentionally not implicit */
+    le_audio_profile_defaults(&audio_profile);
+    if (profile_path
+            ? le_audio_profile_read(profile_path, &audio_profile) < 0
+            : le_audio_profile_load(&audio_profile) < 0) {
+        le_log_warn("audiod: audio profile invalid; using MT8163 layout");
+        le_audio_profile_defaults(&audio_profile);
+    }
+    audio_profile_lidar = !strcmp(audio_profile.speaker_chain, "lidar");
+    if (!card_set)
+        card = audio_profile.playback_card;
     le_log_info("audiod: starting (socket=%s, card=%d)", socket_path, card);
 
     memset(&action, 0, sizeof(action));

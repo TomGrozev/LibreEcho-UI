@@ -203,6 +203,8 @@ Each daemon owns one hardware domain and exposes it via the adapter protocol.
 
 **ALSA interface:** Direct ioctl on `/dev/snd/controlC0`. Enumerates controls, reads/writes values. Falls back to `amixer` if ioctl fails.
 
+**Audio profile:** audiod, micd and the web daemon read `/etc/libreecho/audio-profile` (see `src/adapter/audio_profile.h`). The image build renders it from the target table; a missing file, or one carrying only the original MT8163 keys, reproduces the MT8163 layout byte for byte. The profile names the PCM card and device, the capture format and channel roles, the mixer chain each daemon applies, and the AEC reference source. audiod owns the codec mute switches; micd owns the ADC input and per-PGA gain.
+
 #### ledd — LED Ring Control
 
 **Socket:** `/run/libreecho/led.sock`
@@ -409,6 +411,7 @@ Browser: displays scan results
 
 /etc/libreecho/
 ├── web-config.json          # Read-only first-boot defaults
+├── audio-profile            # Per-image audio layout, when the target renders one
 ├── airplay2.conf            # Packaged integration defaults
 └── led-state.json           # Per-boot LED daemon working state
 

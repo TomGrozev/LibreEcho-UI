@@ -380,6 +380,17 @@ cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
     src/adapter/adapter_client.c src/adapter/adapter_server.c src/log.c \
     -lm -o build/test-micd
 ./build/test-micd
+cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
+    -Isrc -Isrc/adapter tests/test_audio_profile.c \
+    -o build/test-audio-profile
+./build/test-audio-profile
+# The Lidar path: 8-channel S32 capture, capture_roles lane mapping, the
+# separate 48 kHz AEC reference, and the MT8163 passthrough relay.
+cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
+    -Isrc -Isrc/adapter tests/test_micd_lidar.c src/adapter/mic_beamformer.c \
+    src/adapter/voice_dsp.c src/adapter/adapter_server.c src/log.c \
+    -lm -o build/test-micd-lidar
+./build/test-micd-lidar
 sh tests/test_waked_init_model.sh
 cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
     -Isrc -Isrc/adapter tests/test_voice_dsp.c src/adapter/voice_dsp.c \

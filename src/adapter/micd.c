@@ -1,4 +1,5 @@
 #include "adapter.h"
+#include "audio_profile.h"
 #include "log.h"
 #include "mic_beamformer.h"
 #include "voice_dsp.h"
@@ -38,7 +39,19 @@ struct micd_config {
     const char *pcm_path;
     const char *capture_bin;
     const char *mixer_bin;
+    const char *profile_path;
+    int pcm_path_set;
+    struct le_audio_profile profile;
 };
+
+/*
+ * The consumer contract is fixed: raw streams are 9 lanes of packed S24_3LE
+ * at 16 kHz, lanes 7 and 8 reserved.  The profile decides what the hardware
+ * actually captures; this module converts into that contract, so waked,
+ * agentd and the web baby monitor never learn the target's layout.
+ */
+#define MIC_EXPORT_CHANNELS LE_VOICE_RAW_CHANNELS
+#define MIC_EXPORT_BYTES LE_VOICE_BYTES_PER_SAMPLE
 
 static volatile sig_atomic_t running = 1;
 
@@ -666,26 +679,79 @@ static long saved_capture_gain(void)
     return percent;
 }
 
-static int micpga_volume_from_environment(void)
+/* Owner-facing 0..100 gain; the per-codec volume range is applied below. */
+static int capture_gain_percent(void)
 {
     const char *text = getenv("LE_MIC_CAPTURE_GAIN");
     char *end;
     long percent = saved_capture_gain();
 
-    if (percent >= 0)
-        return (int)(percent * MICPGA_MAX_VOLUME / 100);
+    if (percent >= 0 && percent <= 100)
+        return (int)percent;
     if (!text || !text[0])
-        return MICPGA_DEFAULT_VOLUME;
+        return MICPGA_DEFAULT_VOLUME * 100 / MICPGA_MAX_VOLUME;
     errno = 0;
     percent = strtol(text, &end, 10);
     if (errno || *end || percent < 0 || percent > 100)
-        return MICPGA_DEFAULT_VOLUME;
-    return (int)(percent * MICPGA_MAX_VOLUME / 100);
+        return MICPGA_DEFAULT_VOLUME * 100 / MICPGA_MAX_VOLUME;
+    return (int)percent;
+}
+
+static int micpga_volume_from_environment(void)
+{
+    return capture_gain_percent() * MICPGA_MAX_VOLUME / 100;
+}
+
+static int configure_lidar_capture_path(const struct micd_config *config)
+{
+    static const char *const adc[4] = { "ADC1", "ADC2", "ADC3", "ADC4" };
+    char volume[16];
+    unsigned int i;
+
+    /* The Lidar PGA range is 0..80 here, so a percentage matches audiod's
+     * own writer. */
+    (void)snprintf(volume, sizeof(volume), "%d%%", capture_gain_percent());
+    for (i = 0; i < 4; ++i) {
+        struct mixer_setting settings[2];
+        char left[64], right[64];
+
+        (void)snprintf(left, sizeof(left),
+                       "%s Left Input DIF_2L_3L Capture Switch", adc[i]);
+        (void)snprintf(right, sizeof(right),
+                       "%s Right Input DIF_2R_3R Capture Switch", adc[i]);
+        settings[0].control = left;
+        settings[0].value = "1";
+        settings[0].value2 = NULL;
+        settings[1].control = right;
+        settings[1].value = "1";
+        settings[1].value2 = NULL;
+        {
+            char pga_volume[48];
+
+            (void)snprintf(pga_volume, sizeof(pga_volume),
+                           "%s PGA Capture Volume", adc[i]);
+            if (apply_mixer_setting(config->mixer_bin, &settings[0]) < 0 ||
+                apply_mixer_setting(config->mixer_bin, &settings[1]) < 0) {
+                le_log_error("micd: Lidar ADC %s setup failed", adc[i]);
+                return -1;
+            }
+            settings[0].control = pga_volume;
+            settings[0].value = volume;
+            settings[0].value2 = volume;
+            if (apply_mixer_setting(config->mixer_bin, &settings[0]) < 0) {
+                le_log_warn("micd: capture PGA %s refused for %s", volume,
+                            pga_volume);
+                return -1;
+            }
+        }
+    }
+    le_log_info("micd: Lidar OCM capture path configured (PGA %s)", volume);
+    return 0;
 }
 
 static int configure_capture_path(const struct micd_config *config)
 {
-    char micpga[8];
+    char micpga[16];
     char default_micpga[8];
     struct mixer_setting micpga_settings[4];
     static const char *const micpga_controls[4] = {
@@ -716,6 +782,8 @@ static int configure_capture_path(const struct micd_config *config)
     };
     size_t i;
 
+    if (!strcmp(config->profile.capture_chain, "lidar"))
+        return configure_lidar_capture_path(config);
     for (i = 0; i < sizeof(settings) / sizeof(settings[0]); ++i) {
         if (apply_mixer_setting(config->mixer_bin, &settings[i]) < 0) {
             le_log_error("unable to apply microphone mixer control: %s",
@@ -772,8 +840,8 @@ static int format_status(char *buffer, size_t size,
     n = snprintf(
         buffer, size,
         "{\"available\":%s,\"simulated\":false,"
-        "\"sources\":[{\"id\":\"0:24\",\"card\":0,\"device\":24,"
-        "\"name\":\"Amazon MT8163 microphone array\","
+        "\"sources\":[{\"id\":\"%d:%d\",\"card\":%d,\"device\":%d,"
+        "\"name\":\"%s microphone array\","
         "\"rate\":16000,\"channels\":9,\"bits\":24,\"valid_bits\":16,"
         "\"encoding\":\"pcm_s24_3le\","
         "\"microphones\":["
@@ -807,6 +875,10 @@ static int format_status(char *buffer, size_t size,
         "\"highpass_hz\":80,\"vad\":\"native-energy-baseline\","
         "\"aec\":false,\"beamforming\":true,\"wake_word\":false}}",
         available ? "true" : "false",
+        config->profile.capture_card, config->profile.capture_device,
+        config->profile.capture_card, config->profile.capture_device,
+        !strcmp(config->profile.capture_chain, "lidar")
+            ? "Lidar" : "Amazon MT8163",
         capture_active ? "true" : "false",
         capture_active ? "\"raw-stream\"" : "null",
         capture_configured ? "true" : "false",
@@ -847,72 +919,108 @@ static int parse_channel(const char *args, int *channel)
     return 0;
 }
 
-static int relay_capture(int client_fd, const struct micd_config *config)
-{
-    int pipe_fds[2];
-    pid_t capture;
-    char buffer[8192];
-    ssize_t count;
+struct capture_layout {
+    unsigned int channels;
+    unsigned int rate;
+    enum le_audio_format format;
+    size_t frame_bytes;
+    unsigned int logical_channel[LE_AUDIO_PROFILE_ROLE_SLOTS];
+    unsigned int aec_slot[2];
+    unsigned int aec_slots;
+    int passthrough;
+};
 
-    if (pipe(pipe_fds) < 0)
-        return -1;
-    capture = fork();
-    if (capture < 0) {
-        close(pipe_fds[0]);
-        close(pipe_fds[1]);
-        return -1;
+static void capture_layout_init(const struct le_audio_profile *profile,
+                                struct capture_layout *layout)
+{
+    unsigned int channel;
+
+    memset(layout, 0, sizeof(*layout));
+    layout->channels = profile->capture_channels;
+    layout->rate = profile->capture_rate;
+    layout->format = profile->capture_format;
+    layout->frame_bytes = layout->channels *
+                          le_audio_profile_bytes(layout->format);
+    for (channel = 0; channel < layout->channels &&
+                      channel < LE_AUDIO_PROFILE_ROLE_SLOTS; ++channel)
+        layout->logical_channel[channel] = channel < LE_VOICE_LOGICAL_CHANNELS
+            ? channel : 0;
+    for (channel = 0; channel < layout->channels &&
+                      channel < LE_AUDIO_PROFILE_ROLE_SLOTS; ++channel) {
+        int role = profile->capture_roles[channel];
+
+        if (role >= LE_AUDIO_ROLE_MIC0 && role <= LE_AUDIO_ROLE_MIC6)
+            layout->logical_channel[role - LE_AUDIO_ROLE_MIC0] = channel;
+        else if (role == LE_AUDIO_ROLE_AEC &&
+                 layout->aec_slots < 2)
+            layout->aec_slot[layout->aec_slots++] = channel;
     }
-    if (capture == 0) {
-        char *const argv[] = {
-            (char *)"tinycap", (char *)"--",
-            (char *)"-D", (char *)"0",
-            (char *)"-d", (char *)"24",
-            (char *)"-c", (char *)"9",
-            (char *)"-r", (char *)"16000",
-            (char *)"-b", (char *)"24",
-            (char *)"-p", (char *)"640",
-            /*
-             * 640 frames is 40 ms at 16 kHz.  Four periods consume the
-             * Amazon SPI PCM driver's full 69120-byte ring and provide
-             * enough scheduling headroom for the wake inference thread.
-             */
-            (char *)"-n", (char *)"4",
-            NULL
-        };
-        close(pipe_fds[0]);
-        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0)
-            _exit(127);
-        close(pipe_fds[1]);
-        execv(config->capture_bin, argv);
-        _exit(127);
-    }
-    close(pipe_fds[1]);
-    while ((count = read(pipe_fds[0], buffer, sizeof(buffer))) > 0) {
-        if (write_all(client_fd, buffer, (size_t)count) < 0)
-            break;
-    }
-    close(pipe_fds[0]);
-    kill(capture, SIGTERM);
-    while (waitpid(capture, NULL, 0) < 0 && errno == EINTR)
-        ;
-    return count < 0 ? -1 : 0;
+    /* The MT8163 layout already is the wire contract: nine packed 24-bit
+     * lanes in order with the AEC lanes last, so its capture can be forwarded
+     * byte for byte instead of unpacked and repacked. */
+    layout->passthrough = layout->format == LE_AUDIO_FORMAT_S24_3LE &&
+                          layout->channels == LE_VOICE_RAW_CHANNELS &&
+                          layout->aec_slots == 2 &&
+                          layout->aec_slot[0] == 7 &&
+                          layout->aec_slot[1] == 8;
+    for (channel = 0; channel < LE_VOICE_LOGICAL_CHANNELS; ++channel)
+        if (layout->logical_channel[channel] != channel)
+            layout->passthrough = 0;
 }
 
-static pid_t start_capture(const struct micd_config *config, int output_fd)
+static int16_t capture_sample(const unsigned char *frame, size_t offset,
+                              enum le_audio_format format)
 {
-    pid_t capture = fork();
+    const unsigned char *p = frame + offset;
 
+    switch (format) {
+    case LE_AUDIO_FORMAT_S16_LE:
+        return (int16_t)((uint16_t)p[0] | (uint16_t)p[1] << 8);
+    case LE_AUDIO_FORMAT_S24_3LE: {
+        int32_t value = (int32_t)((uint32_t)p[0] << 8 |
+                                  (uint32_t)p[1] << 16 |
+                                  (uint32_t)p[2] << 24) >> 8;
+
+        return (int16_t)(value >> 8);
+    }
+    case LE_AUDIO_FORMAT_S32_LE:
+        return (int16_t)(((int32_t)((uint32_t)p[0] |
+                                    (uint32_t)p[1] << 8 |
+                                    (uint32_t)p[2] << 16 |
+                                    (uint32_t)p[3] << 24)) >> 16);
+    }
+    return 0;
+}
+
+static pid_t start_capture_pcm(const struct micd_config *config, int output_fd,
+                               int card, int device, unsigned int channels,
+                               unsigned int rate, enum le_audio_format format)
+{
+    char card_text[16], device_text[16], channel_text[16], rate_text[16];
+    char bits_text[16], period_text[16];
+    unsigned int period = rate / 25; /* 40 ms, as the Amazon SPI ring expects */
+    pid_t capture;
+
+    (void)snprintf(card_text, sizeof(card_text), "%d", card);
+    (void)snprintf(device_text, sizeof(device_text), "%d", device);
+    (void)snprintf(channel_text, sizeof(channel_text), "%u", channels);
+    (void)snprintf(rate_text, sizeof(rate_text), "%u", rate);
+    (void)snprintf(bits_text, sizeof(bits_text), "%d",
+                   le_audio_profile_bits(format));
+    (void)snprintf(period_text, sizeof(period_text), "%u", period);
+
+    capture = fork();
     if (capture != 0)
         return capture;
     {
         char *const argv[] = {
             (char *)"tinycap", (char *)"--",
-            (char *)"-D", (char *)"0",
-            (char *)"-d", (char *)"24",
-            (char *)"-c", (char *)"9",
-            (char *)"-r", (char *)"16000",
-            (char *)"-b", (char *)"24",
-            (char *)"-p", (char *)"640",
+            (char *)"-D", card_text,
+            (char *)"-d", device_text,
+            (char *)"-c", channel_text,
+            (char *)"-r", rate_text,
+            (char *)"-b", bits_text,
+            (char *)"-p", period_text,
             (char *)"-n", (char *)"4",
             NULL
         };
@@ -926,6 +1034,324 @@ static pid_t start_capture(const struct micd_config *config, int output_fd)
     }
 }
 
+static pid_t start_capture(const struct micd_config *config, int output_fd)
+{
+    return start_capture_pcm(config, output_fd,
+                             config->profile.capture_card,
+                             config->profile.capture_device,
+                             config->profile.capture_channels,
+                             config->profile.capture_rate,
+                             config->profile.capture_format);
+}
+
+/*
+ * One mono AEC reference lane, resampled 48 kHz -> 16 kHz by a 193-tap
+ * Kaiser-windowed low-pass (7 kHz passband edge, 60 dB down at 8 kHz) and
+ * decimation by three.  hw:0,2 is a bit-exact loopback of the playback bus
+ * and cannot rate-convert, so the conversion belongs here.
+ *
+ * Group delay is (193 - 1) / 2 = 96 input samples = 32 output samples, so
+ * the emitted reference is a fixed 32 samples (2 ms) behind the microphone
+ * frame.  Keep this delay constant: the voice AEC aligns the two streams by
+ * correlation and a moving delay would make that alignment wander.
+ */
+#define REFERENCE_FIR_TAPS 193
+static const int16_t reference_fir[REFERENCE_FIR_TAPS] = {
+    0, -2, -3, -1, 3, 5, 2, -3,
+    -7, -4, 3, 9, 7, -2, -11, -11,
+    0, 13, 16, 4, -14, -21, -9, 14,
+    27, 16, -12, -32, -25, 7, 37, 35,
+    0, -40, -47, -11, 41, 60, 25, -38,
+    -72, -42, 31, 83, 63, -18, -92, -87,
+    0, 96, 112, 25, -95, -139, -57, 87,
+    164, 96, -69, -186, -141, 41, 204, 193,
+    0, -213, -249, -55, 211, 308, 127, -194,
+    -369, -217, 158, 430, 330, -97, -489, -471,
+    0, 543, 652, 149, -590, -899, -388, 630,
+    1281, 817, -659, -2032, -1836, 677, 4813, 8671,
+    10241, 8671, 4813, 677, -1836, -2032, -659, 817,
+    1281, 630, -388, -899, -590, 149, 652, 543,
+    0, -471, -489, -97, 330, 430, 158, -217,
+    -369, -194, 127, 308, 211, -55, -249, -213,
+    0, 193, 204, 41, -141, -186, -69, 96,
+    164, 87, -57, -139, -95, 25, 112, 96,
+    0, -87, -92, -18, 63, 83, 31, -42,
+    -72, -38, 25, 60, 41, -11, -47, -40,
+    0, 35, 37, 7, -25, -32, -12, 16,
+    27, 14, -9, -21, -14, 4, 16, 13,
+    0, -11, -11, -2, 7, 9, 3, -4,
+    -7, -3, 2, 5, 3, -1, -3, -2,
+    0
+};
+
+struct reference_source {
+    int fd;
+    enum le_audio_format format;
+    unsigned int channels;
+    unsigned int factor;
+    int16_t samples[8192];
+    size_t head;
+    size_t tail;
+    int16_t last;
+    int have_last;
+    int16_t history[REFERENCE_FIR_TAPS];
+    size_t history_pos;
+    unsigned char residue[16];
+    size_t residue_bytes;
+};
+
+static void reference_push(struct reference_source *reference,
+                           const unsigned char *frame)
+{
+    size_t bytes = le_audio_profile_bytes(reference->format);
+    int32_t sum = 0;
+    unsigned int channel;
+    size_t slot;
+
+    for (channel = 0; channel < reference->channels; ++channel)
+        sum += capture_sample(frame, channel * bytes, reference->format);
+    slot = (reference->head + 1) % (sizeof(reference->samples) /
+                                    sizeof(reference->samples[0]));
+    if (slot == reference->tail)
+        reference->tail = (reference->tail + 1) %
+                          (sizeof(reference->samples) /
+                           sizeof(reference->samples[0]));
+    reference->samples[reference->head] =
+        (int16_t)(sum / (int32_t)reference->channels);
+    reference->head = slot;
+}
+
+static void reference_fill(struct reference_source *reference)
+{
+    unsigned char buffer[4096];
+    size_t bytes = le_audio_profile_bytes(reference->format);
+    size_t frame_bytes = bytes * reference->channels;
+    size_t pending = reference->residue_bytes;
+    ssize_t count;
+
+    if (reference->fd < 0 || !frame_bytes || frame_bytes > sizeof(buffer))
+        return;
+    memcpy(buffer, reference->residue, pending);
+    while ((count = read(reference->fd, buffer + pending,
+                         sizeof(buffer) - pending)) > 0) {
+        size_t available = pending + (size_t)count;
+        size_t frames = available / frame_bytes;
+        size_t frame;
+
+        for (frame = 0; frame < frames; ++frame)
+            reference_push(reference, buffer + frame * frame_bytes);
+        pending = available - frames * frame_bytes;
+        if (pending)
+            memmove(buffer, buffer + frames * frame_bytes, pending);
+    }
+    reference->residue_bytes = pending;
+    if (pending)
+        memcpy(reference->residue, buffer, pending);
+}
+
+static int16_t reference_sample(struct reference_source *reference)
+{
+    int64_t sum = 0;
+    int32_t value;
+    unsigned int i;
+    size_t index;
+
+    if (!reference->factor)
+        return 0;
+    for (i = 0; i < reference->factor; ++i) {
+        if (reference->tail != reference->head) {
+            reference->last = reference->samples[reference->tail];
+            reference->tail = (reference->tail + 1) %
+                (sizeof(reference->samples) / sizeof(reference->samples[0]));
+            reference->have_last = 1;
+        }
+        reference->history[reference->history_pos] = reference->have_last
+            ? reference->last : 0;
+        reference->history_pos = (reference->history_pos + 1) %
+                                 REFERENCE_FIR_TAPS;
+    }
+    index = reference->history_pos;
+    for (i = 0; i < REFERENCE_FIR_TAPS; ++i) {
+        index = (index + REFERENCE_FIR_TAPS - 1) % REFERENCE_FIR_TAPS;
+        sum += (int64_t)reference_fir[i] * reference->history[index];
+    }
+    value = (int32_t)(sum >> 15);
+    if (value > INT16_MAX)
+        value = INT16_MAX;
+    else if (value < INT16_MIN)
+        value = INT16_MIN;
+    return (int16_t)value;
+}
+
+static void export_raw_frame(unsigned char out[MIC_EXPORT_CHANNELS *
+                                               MIC_EXPORT_BYTES],
+                             const struct capture_layout *layout,
+                             const unsigned char *frame,
+                             const struct reference_source *reference,
+                             int16_t reference_value)
+{
+    size_t bytes = le_audio_profile_bytes(layout->format);
+    int16_t values[MIC_EXPORT_CHANNELS] = {0};
+    unsigned int channel;
+
+    for (channel = 0; channel < LE_VOICE_LOGICAL_CHANNELS; ++channel)
+        values[channel] = capture_sample(
+            frame, layout->logical_channel[channel] * bytes,
+            layout->format);
+    if (layout->aec_slots > 0)
+        values[7] = capture_sample(frame, layout->aec_slot[0] * bytes,
+                                   layout->format);
+    if (layout->aec_slots > 1)
+        values[8] = capture_sample(frame, layout->aec_slot[1] * bytes,
+                                   layout->format);
+    if (reference->fd >= 0) {
+        values[7] = reference_value;
+        values[8] = reference_value;
+    }
+    for (channel = 0; channel < MIC_EXPORT_CHANNELS; ++channel) {
+        int32_t value = (int32_t)values[channel] << 8;
+
+        out[channel * 3] = (unsigned char)(value & 0xff);
+        out[channel * 3 + 1] = (unsigned char)((value >> 8) & 0xff);
+        out[channel * 3 + 2] = (unsigned char)((value >> 16) & 0xff);
+    }
+}
+
+static int relay_capture(int client_fd, const struct micd_config *config)
+{
+    struct capture_layout layout;
+    struct reference_source reference;
+    unsigned char input[65536];
+    unsigned char output[MIC_EXPORT_CHANNELS * MIC_EXPORT_BYTES * 2048];
+    size_t pending = 0;
+    int pipe_fds[2];
+    int reference_fds[2];
+    pid_t capture;
+    pid_t reference_capture = -1;
+    ssize_t count;
+
+    capture_layout_init(&config->profile, &layout);
+    if (!layout.frame_bytes)
+        return -1;
+    memset(&reference, 0, sizeof(reference));
+    reference.fd = -1;
+    if (config->profile.aec_source == LE_AUDIO_AEC_SEPARATE_PCM) {
+        if (config->profile.aec_rate >= config->profile.capture_rate &&
+            config->profile.aec_rate % config->profile.capture_rate == 0) {
+            if (pipe(reference_fds) == 0) {
+                reference_capture = start_capture_pcm(
+                    config, reference_fds[1], config->profile.aec_card,
+                    config->profile.aec_device, config->profile.aec_channels,
+                    config->profile.aec_rate, config->profile.aec_format);
+                close(reference_fds[1]);
+                if (reference_capture < 0) {
+                    close(reference_fds[0]);
+                } else {
+                    reference.fd = reference_fds[0];
+                    reference.format = config->profile.aec_format;
+                    reference.channels = config->profile.aec_channels;
+                    reference.factor = config->profile.aec_rate /
+                                       config->profile.capture_rate;
+                    {
+                        int flags = fcntl(reference.fd, F_GETFL, 0);
+                        if (flags >= 0)
+                            (void)fcntl(reference.fd, F_SETFL, flags | O_NONBLOCK);
+                    }
+                }
+            }
+        }
+        if (reference.fd < 0)
+            le_log_warn("micd: AEC reference unavailable; raw lanes 7/8 zero");
+    }
+    if (pipe(pipe_fds) < 0) {
+        if (reference.fd >= 0) close(reference.fd);
+        return -1;
+    }
+    capture = start_capture(config, pipe_fds[1]);
+    if (capture < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        if (reference.fd >= 0) close(reference.fd);
+        return -1;
+    }
+    close(pipe_fds[1]);
+    if (layout.passthrough && reference.fd < 0) {
+        /* MT8163: the capture already is the 9-lane S24 contract, so keep
+         * the historical byte-for-byte relay (partial reads included). */
+        while ((count = read(pipe_fds[0], input, sizeof(input))) > 0)
+            if (write_all(client_fd, input, (size_t)count) < 0)
+                break;
+    } else {
+        size_t read_cap = sizeof(output) / (MIC_EXPORT_CHANNELS *
+                                            MIC_EXPORT_BYTES) *
+                          layout.frame_bytes;
+        if (read_cap > sizeof(input))
+            read_cap = sizeof(input);
+        while ((count = read(pipe_fds[0], input + pending,
+                             read_cap - pending)) > 0) {
+            size_t available = pending + (size_t)count;
+            size_t frames = available / layout.frame_bytes;
+            size_t consumed = frames * layout.frame_bytes;
+            size_t frame;
+
+            reference_fill(&reference);
+            for (frame = 0; frame < frames; ++frame) {
+                int16_t reference_value = reference.fd >= 0
+                    ? reference_sample(&reference) : 0;
+
+                export_raw_frame(output + frame * MIC_EXPORT_CHANNELS *
+                                 MIC_EXPORT_BYTES, &layout,
+                                 input + frame * layout.frame_bytes,
+                                 &reference, reference_value);
+            }
+            if (frames &&
+                write_all(client_fd, output,
+                          frames * MIC_EXPORT_CHANNELS * MIC_EXPORT_BYTES) < 0)
+                break;
+            pending = available - consumed;
+            if (pending)
+                memmove(input, input + consumed, pending);
+        }
+    }
+    close(pipe_fds[0]);
+    kill(capture, SIGTERM);
+    while (waitpid(capture, NULL, 0) < 0 && errno == EINTR)
+        ;
+    if (reference.fd >= 0) {
+        close(reference.fd);
+        if (reference_capture > 0) {
+            kill(reference_capture, SIGTERM);
+            while (waitpid(reference_capture, NULL, 0) < 0 && errno == EINTR)
+                ;
+        }
+    }
+    return count < 0 ? -1 : 0;
+}
+
+/* Re-pack the target layout into the 9-lane S24 the voice stack parses. */
+static void normalize_capture_frame(const struct capture_layout *layout,
+                                    const unsigned char *frame,
+                                    unsigned char out[LE_VOICE_RAW_FRAME_BYTES])
+{
+    size_t bytes = le_audio_profile_bytes(layout->format);
+    unsigned int channel;
+
+    if (layout->passthrough) {
+        memcpy(out, frame, LE_VOICE_RAW_FRAME_BYTES);
+        return;
+    }
+    memset(out, 0, LE_VOICE_RAW_FRAME_BYTES);
+    for (channel = 0; channel < LE_VOICE_LOGICAL_CHANNELS; ++channel) {
+        int32_t value = (int32_t)capture_sample(
+            frame, layout->logical_channel[channel] * bytes,
+            layout->format) << 8;
+
+        out[channel * 3] = (unsigned char)(value & 0xff);
+        out[channel * 3 + 1] = (unsigned char)((value >> 8) & 0xff);
+        out[channel * 3 + 2] = (unsigned char)((value >> 16) & 0xff);
+    }
+}
+
 /*
  * Streams calibrated mono audio. The OK header is the only success signal a
  * client gets, so it is written once tinycap has delivered its first period.
@@ -936,13 +1362,15 @@ static int relay_capture_mono(int client_fd, unsigned long id,
                               const char *header, size_t header_size,
                               const struct micd_config *config)
 {
-    static const uint8_t identity_map[LE_VOICE_LOGICAL_CHANNELS] =
-        {0, 1, 2, 3, 4, 5, 6};
     static struct le_beamformer beamformer;
+    struct capture_layout layout;
     struct le_voice_calibration calibration;
     struct le_voice_highpass highpass;
-    unsigned char input[LE_VOICE_RAW_FRAME_BYTES * 256];
+    unsigned char input[65536];
     int16_t output[256];
+    uint8_t logical_map[LE_VOICE_LOGICAL_CHANNELS];
+    size_t frame_bytes;
+    unsigned int lane;
     int miccal[LE_VOICE_LOGICAL_CHANNELS];
     size_t pending = 0;
     int pipe_fds[2];
@@ -952,6 +1380,12 @@ static int relay_capture_mono(int client_fd, unsigned long id,
     unsigned int mix_mask = LE_BEAM_DEFAULT_MIC_MASK;
     int result = -1;
 
+    capture_layout_init(&config->profile, &layout);
+    frame_bytes = layout.frame_bytes;
+    if (!frame_bytes)
+        return -1;
+    for (lane = 0; lane < LE_VOICE_LOGICAL_CHANNELS; ++lane)
+        logical_map[lane] = (uint8_t)lane;
     if (pipe(pipe_fds) < 0)
         return -1;
     capture = start_capture(config, pipe_fds[1]);
@@ -968,7 +1402,7 @@ static int relay_capture_mono(int client_fd, unsigned long id,
      */
     (void)read_miccal(config->idme_dir, config->dt_idme_dir, miccal);
     le_voice_calibration_init(
-        &calibration, miccal, identity_map,
+        &calibration, miccal, logical_map,
         LE_VOICE_CALIBRATION_DIRECT_Q14);
     if (le_beamformer_init(&beamformer, beam_mic_mask(),
                            LE_BEAM_DEFAULT_BEAMS) < 0) {
@@ -981,7 +1415,8 @@ static int relay_capture_mono(int client_fd, unsigned long id,
     le_voice_highpass_init(&highpass);
     mix_mask = beam_mic_mask();
 
-    count = read(pipe_fds[0], input, sizeof(input));
+    count = read(pipe_fds[0], input,
+                 sizeof(output) / sizeof(output[0]) * frame_bytes);
     if (count <= 0) {
         /* tinycap exited before its first period: no capture, say so. */
         char error[LE_ADAPTER_MSG_MAX];
@@ -993,18 +1428,21 @@ static int relay_capture_mono(int client_fd, unsigned long id,
     } else if (write_all(client_fd, header, header_size) == 0) {
         while (count > 0) {
             size_t available = pending + (size_t)count;
-            size_t frames = available / LE_VOICE_RAW_FRAME_BYTES;
-            size_t consumed = frames * LE_VOICE_RAW_FRAME_BYTES;
+            size_t frames = available / frame_bytes;
+            size_t consumed = frames * frame_bytes;
 
             if (frames > 0) {
                 size_t frame;
 
                 for (frame = 0; frame < frames; ++frame) {
                     int16_t logical[LE_VOICE_LOGICAL_CHANNELS];
+                    unsigned char normalized[LE_VOICE_RAW_FRAME_BYTES];
 
+                    normalize_capture_frame(&layout,
+                                            input + frame * frame_bytes,
+                                            normalized);
                     le_voice_decode_calibrated(
-                        input + frame * LE_VOICE_RAW_FRAME_BYTES,
-                        &calibration, logical);
+                        normalized, &calibration, logical);
                     /* The beamformer runs in every mode, so its selection
                        and beam view stay warm; the mode only picks the
                        output. */
@@ -1029,7 +1467,8 @@ static int relay_capture_mono(int client_fd, unsigned long id,
             if (pending > 0)
                 memmove(input, input + consumed, pending);
             count = read(pipe_fds[0], input + pending,
-                         sizeof(input) - pending);
+                         sizeof(output) / sizeof(output[0]) * frame_bytes -
+                         pending);
         }
         result = count < 0 ? -1 : 0;
     }
@@ -1102,12 +1541,12 @@ static int respond(int client_fd, unsigned long id, int ok,
 int main(int argc, char **argv)
 {
     struct micd_config config = {
-        LE_ADAPTER_MIC_SOCK,
-        "/proc/idme",
-        "/sys/firmware/devicetree/base/idme",
-        "/dev/snd/pcmC0D24c",
-        "/sbin/tinycap",
-        "/sbin/tinymix"
+        .socket_path = LE_ADAPTER_MIC_SOCK,
+        .idme_dir = "/proc/idme",
+        .dt_idme_dir = "/sys/firmware/devicetree/base/idme",
+        .pcm_path = "/dev/snd/pcmC0D24c",
+        .capture_bin = "/sbin/tinycap",
+        .mixer_bin = "/sbin/tinymix"
     };
     pid_t stream_worker = -1;
     int capture_configured = 0;
@@ -1126,6 +1565,9 @@ int main(int argc, char **argv)
             config.dt_idme_dir = argv[++i];
         } else if (!strcmp(argv[i], "--pcm-path") && i + 1 < argc) {
             config.pcm_path = argv[++i];
+            config.pcm_path_set = 1;
+        } else if (!strcmp(argv[i], "--profile") && i + 1 < argc) {
+            config.profile_path = argv[++i];
         } else if (!strcmp(argv[i], "--capture-bin") && i + 1 < argc) {
             config.capture_bin = argv[++i];
         } else if (!strcmp(argv[i], "--mixer-bin") && i + 1 < argc) {
@@ -1139,7 +1581,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "Usage: %s [--foreground] [--socket PATH] "
                     "[--idme-dir DIR] [--pcm-path PATH] "
                     "[--dt-idme-dir DIR] "
-                    "[--capture-bin PATH] [--mixer-bin PATH]\n", argv[0]);
+                    "[--capture-bin PATH] [--mixer-bin PATH] "
+                    "[--profile PATH]\n", argv[0]);
             return 2;
         }
     }
@@ -1148,6 +1591,32 @@ int main(int argc, char **argv)
     signal(SIGTERM, stop_handler);
     signal(SIGCHLD, child_handler);
     signal(SIGPIPE, SIG_IGN);
+    if (config.profile_path) {
+        int parsed = le_audio_profile_read(config.profile_path,
+                                           &config.profile);
+        if (parsed < 0) {
+            le_log_error("micd: audio profile %s is invalid",
+                         config.profile_path);
+            return 2;
+        }
+        if (parsed == 0)
+            le_audio_profile_defaults(&config.profile);
+    } else if (le_audio_profile_load(&config.profile) < 0) {
+        le_log_warn("micd: audio profile invalid; using MT8163 layout");
+    }
+    if (!config.pcm_path_set) {
+        static char pcm_path[64];
+
+        (void)snprintf(pcm_path, sizeof(pcm_path), "/dev/snd/pcmC%dD%dc",
+                       config.profile.capture_card,
+                       config.profile.capture_device);
+        config.pcm_path = pcm_path;
+    }
+    if (config.profile.capture_rate != 16000) {
+        le_log_error("micd: capture rate %u is not supported (need 16000)",
+                     config.profile.capture_rate);
+        return 2;
+    }
     if (access(config.pcm_path, R_OK) == 0) {
         capture_configured = configure_capture_path(&config) == 0;
         if (capture_configured)
