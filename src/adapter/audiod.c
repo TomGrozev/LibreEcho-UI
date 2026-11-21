@@ -112,6 +112,9 @@ struct snd_ctl_elem_info {
     union {
         struct { long min, max, step; } integer;
         struct { long long min, max, step; } integer64;
+        /* The kernel selects the item to name through `item` and returns its
+         * text in `name`. */
+        struct { unsigned int items, item; char name[64]; } enumerated;
         unsigned char reserved[128];
     } value;
     unsigned char reserved[64];
@@ -237,6 +240,10 @@ struct audio_hw {
     struct audio_control capture_switch;
     struct audio_control amplifier_switch;
     struct audio_control output_route;
+    /* Lidar only: the DAC reaches the line-out drivers through the output
+     * mixers, and Amazon's boot sequence runs the drivers at 0 dB. */
+    struct audio_control lidar_lol_mixer;
+    struct audio_control lidar_lor_mixer;
     int have_card_info;
     int output_available;
     int volume;
@@ -776,6 +783,18 @@ static int enumerate_controls(struct audio_hw *audio)
             select_control(&audio->amplifier_switch, &ids[i], &info);
             continue;
         }
+        if (audio_profile_lidar &&
+            !strcmp((const char *)ids[i].name,
+                    "LOL Output Mixer L_DAC Switch")) {
+            select_control(&audio->lidar_lol_mixer, &ids[i], &info);
+            continue;
+        }
+        if (audio_profile_lidar &&
+            !strcmp((const char *)ids[i].name,
+                    "LOR Output Mixer R_DAC Switch")) {
+            select_control(&audio->lidar_lor_mixer, &ids[i], &info);
+            continue;
+        }
         if (info.type != SNDRV_CTL_ELEM_TYPE_BOOLEAN &&
             info.type != SNDRV_CTL_ELEM_TYPE_INTEGER &&
             info.type != SNDRV_CTL_ELEM_TYPE_INTEGER64)
@@ -853,15 +872,43 @@ static long long speaker_value_for_percent(long long min, long long max,
     return floor + ((unity - floor) * (percent - 1) + 49) / 99;
 }
 
+/* Write the same raw value to every channel of an integer, boolean or
+ * enumerated control.  Percentages are the wrong unit for a driver gain or an
+ * enum item, and amixer is not part of this image. */
+static int write_raw_control(const struct audio_hw *audio,
+                             const struct audio_control *control,
+                             long long value)
+{
+    struct snd_ctl_elem_value elem;
+    unsigned int i;
+
+    if (!control->found || !control->writable || audio->ctl_fd < 0)
+        return -1;
+    memset(&elem, 0, sizeof(elem));
+    elem.id = control->id;
+    if (control->info.type == SNDRV_CTL_ELEM_TYPE_INTEGER64) {
+        for (i = 0; i < control->info.count && i < 64; ++i)
+            elem.value.integer64.value[i] = value;
+    } else if (control->info.type == SNDRV_CTL_ELEM_TYPE_INTEGER ||
+               control->info.type == SNDRV_CTL_ELEM_TYPE_BOOLEAN) {
+        for (i = 0; i < control->info.count && i < 128; ++i)
+            elem.value.integer.value[i] = (long)value;
+    } else if (control->info.type == SNDRV_CTL_ELEM_TYPE_ENUMERATED) {
+        for (i = 0; i < control->info.count && i < 128; ++i)
+            elem.value.enumerated.item[i] = (unsigned int)value;
+    } else {
+        return -1;
+    }
+    return ioctl(audio->ctl_fd, SNDRV_CTL_IOCTL_ELEM_WRITE, &elem) < 0 ? -1 : 0;
+}
+
 static int write_percent_control(const struct audio_hw *audio,
                                  const struct audio_control *control,
                                  int percent)
 {
-    struct snd_ctl_elem_value elem;
     long long min;
     long long max;
     long long value;
-    unsigned int i;
 
     if (!control->found || !control->writable || audio->ctl_fd < 0)
         return -1;
@@ -884,35 +931,43 @@ static int write_percent_control(const struct audio_hw *audio,
           ? speaker_value_for_percent(min, max, percent)
           : value_for_percent(min, max, percent);
     if (value < min || value > max) return -1;
-
-    memset(&elem, 0, sizeof(elem));
-    elem.id = control->id;
-    if (control->info.type == SNDRV_CTL_ELEM_TYPE_INTEGER64) {
-        for (i = 0; i < control->info.count && i < 64; ++i)
-            elem.value.integer64.value[i] = value;
-    } else {
-        for (i = 0; i < control->info.count && i < 128; ++i)
-            elem.value.integer.value[i] = (long)value;
-    }
-    return ioctl(audio->ctl_fd, SNDRV_CTL_IOCTL_ELEM_WRITE, &elem) < 0 ? -1 : 0;
+    return write_raw_control(audio, control, value);
 }
 
 static int write_switch_control(const struct audio_hw *audio,
                                 const struct audio_control *control, int muted)
 {
-    struct snd_ctl_elem_value elem;
-    long value;
-    unsigned int i;
-
     if (!control->found || !control->writable || audio->ctl_fd < 0 ||
         control->info.type != SNDRV_CTL_ELEM_TYPE_BOOLEAN)
         return -1;
-    value = control->mute_semantics ? muted : !muted;
-    memset(&elem, 0, sizeof(elem));
-    elem.id = control->id;
-    for (i = 0; i < control->info.count && i < 128; ++i)
-        elem.value.integer.value[i] = value;
-    return ioctl(audio->ctl_fd, SNDRV_CTL_IOCTL_ELEM_WRITE, &elem) < 0 ? -1 : 0;
+    return write_raw_control(audio, control,
+                             control->mute_semantics ? muted : !muted);
+}
+
+/* Map a name to the enumerated item index that ELEM_WRITE expects.  The
+ * machine driver names the Speaker route but the ioctl takes the index, and
+ * the index is not a stable ABI, so read the item names back. */
+static int enum_item_index(const struct audio_hw *audio,
+                           const struct audio_control *control,
+                           const char *name)
+{
+    struct snd_ctl_elem_info info;
+    unsigned int item;
+
+    if (!control->found || audio->ctl_fd < 0 || !name || !*name ||
+        control->info.type != SNDRV_CTL_ELEM_TYPE_ENUMERATED)
+        return -1;
+    for (item = 0; item < control->info.value.enumerated.items; ++item) {
+        memset(&info, 0, sizeof(info));
+        info.id = control->id;
+        info.value.enumerated.item = item;
+        if (ioctl(audio->ctl_fd, SNDRV_CTL_IOCTL_ELEM_INFO, &info) < 0)
+            return -1;
+        if (info.value.enumerated.item == item &&
+            !strcmp(info.value.enumerated.name, name))
+            return (int)item;
+    }
+    return -1;
 }
 
 static int run_amixer(const struct audio_hw *audio, const char *name,
@@ -1287,6 +1342,16 @@ static void apply_persisted_levels(struct audio_hw *audio)
     }
 }
 
+/* Amazon's Lidar boot sequence starts the speaker at -40 dB.  The engine's
+ * logical taper, -12 - 48 * (1 - x)^1.3 dB, reaches that at 35%, so first
+ * boot is quiet instead of the MT8163 default's 50%. */
+#define LE_LIDAR_DEFAULT_VOLUME 35
+
+static int default_master_volume(void)
+{
+    return audio_profile_lidar ? LE_LIDAR_DEFAULT_VOLUME : 50;
+}
+
 static void audio_init(struct audio_hw *audio, int card)
 {
     struct snd_ctl_card_info card_info;
@@ -1294,7 +1359,7 @@ static void audio_init(struct audio_hw *audio, int card)
     memset(audio, 0, sizeof(*audio));
     audio->card = card;
     audio->ctl_fd = -1;
-    audio->volume = 50;
+    audio->volume = default_master_volume();
     audio->gain = 65;
     audio->requested_volume = -1;
     audio->volume_guard_warned = 0;
@@ -1351,13 +1416,26 @@ static void audio_init(struct audio_hw *audio, int card)
     (void)enumerate_controls(audio);
     if (audio_profile_lidar) {
         /*
-         * The AIC32x4 has no standalone speaker-enable pin exposed here:
-         * selecting the machine driver's Speaker route programs the biquads,
-         * mono mix and amplifier together.  Setting it once at startup lets
-         * the engine own only the DAC mute switch.
+         * Selecting the machine driver's Speaker route programs the
+         * crossover, mono mix and amplifier, but the DAC only reaches the
+         * line-out drivers through the two output mixers: leave those off
+         * and the speaker stays silent.  Amazon's boot sequence enables
+         * both, and so does this, so playback does not depend on the
+         * engine's arm sequence having run.  The engine still owns the
+         * LO DAC mute switch.
          */
-        if (run_amixer(audio, "Output Route", "Speaker") < 0)
-            le_log_warn("audiod: Lidar Output Route=Speaker refused");
+        {
+            int speaker = enum_item_index(audio, &audio->output_route,
+                                          "Speaker");
+
+            if (speaker < 0 ||
+                write_raw_control(audio, &audio->output_route, speaker) < 0)
+                le_log_warn("audiod: Lidar Output Route=Speaker refused");
+        }
+        if (write_raw_control(audio, &audio->lidar_lol_mixer, 1) < 0)
+            le_log_warn("audiod: Lidar LOL output mixer unavailable");
+        if (write_raw_control(audio, &audio->lidar_lor_mixer, 1) < 0)
+            le_log_warn("audiod: Lidar LOR output mixer unavailable");
     }
     refresh_state(audio);
     audio->amplifier_on = 0;

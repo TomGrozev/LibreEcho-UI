@@ -37,6 +37,8 @@ static void require_condition(int condition, const char *message)
 }
 
 static int codec_raw, codec_writes, codec_fail;
+static int codec_log[16], codec_log_count;
+static int codec_enum, enum_raw, enum_writes;
 static int review_ioctl(int fd, unsigned long request, ...)
 {
     va_list ap;
@@ -46,12 +48,30 @@ static int review_ioctl(int fd, unsigned long request, ...)
     va_end(ap);
     if (fd != 100000) return (int)syscall(SYS_ioctl, fd, request, arg);
     if (codec_fail) { errno = EIO; return -1; }
+    if (request == SNDRV_CTL_IOCTL_ELEM_INFO) {
+        static const char *const items[] = { "Off", "HP", "Speaker" };
+        struct snd_ctl_elem_info *info = arg;
+        unsigned int item = info->value.enumerated.item;
+
+        if (item >= sizeof(items) / sizeof(items[0])) { errno = EINVAL; return -1; }
+        info->value.enumerated.item = item;
+        snprintf(info->value.enumerated.name,
+                 sizeof(info->value.enumerated.name), "%s", items[item]);
+        return 0;
+    }
     if (request == SNDRV_CTL_IOCTL_ELEM_READ) {
         ((struct snd_ctl_elem_value *)arg)->value.integer.value[0] = codec_raw;
         return 0;
     }
     if (request == SNDRV_CTL_IOCTL_ELEM_WRITE) {
+        if (codec_enum) {
+            enum_raw = (int)((struct snd_ctl_elem_value *)arg)->value.enumerated.item[0];
+            enum_writes++;
+            return 0;
+        }
         codec_raw = (int)((struct snd_ctl_elem_value *)arg)->value.integer.value[0];
+        if (codec_log_count < (int)(sizeof(codec_log) / sizeof(codec_log[0])))
+            codec_log[codec_log_count++] = codec_raw;
         codec_writes++;
         return 0;
     }
@@ -72,7 +92,7 @@ static void fixture_restart_codec(struct audio_hw *audio)
 
 static void fixture_codec(struct audio_hw *audio)
 {
-    codec_raw = 0; codec_writes = 0; codec_fail = 0;
+    codec_raw = 0; codec_writes = 0; codec_fail = 0; codec_log_count = 0;
     fixture_restart_codec(audio);
 }
 
@@ -294,6 +314,90 @@ static void test_physical_reference_range(void)
                       "codec reference is raw 0 dB, never boosted maximum");
     require_condition(speaker_value_for_percent(0, 126, 100) < 0,
                       "codec lacking unity must not claim an available reference");
+}
+
+/*
+ * AIC32x4 PCM Playback Volume is 0..175 in 0.5 dB steps with 0 dB at 127;
+ * the 48 steps above it are digital gain the line-out drivers must not see.
+ * The guard drives the codec only to that 0 dB reference (the same raw value
+ * MT8163 gets), and Lidar's first boot starts at the engine taper's -40 dB
+ * point.
+ */
+static void test_lidar_speaker_levels(void)
+{
+    struct audio_hw audio;
+
+    audio_profile_lidar = 1;
+    require_condition(default_master_volume() == 35,
+                      "Lidar first boot starts at the quiet -40 dB level");
+    memset(&audio, 0, sizeof(audio));
+    fixture_codec(&audio);
+    audio.master.info.value.integer.max = 175;
+    codec_raw = 0;
+    codec_writes = 0;
+    require_condition(ensure_physical_reference(&audio) == 0 &&
+                      codec_raw == 127 && codec_writes == 1,
+                      "Lidar reference holds the codec at raw 0 dB");
+    audio_profile_lidar = 0;
+    require_condition(default_master_volume() == 50,
+                      "MT8163 default volume is unchanged");
+}
+
+/* The machine driver names the Speaker route, but ELEM_WRITE takes the item
+ * index and the index is not a stable ABI, so it is resolved by name. */
+static void test_lidar_output_route_enum(void)
+{
+    struct audio_hw audio;
+    int item;
+
+    memset(&audio, 0, sizeof(audio));
+    fixture_codec(&audio);
+    audio.output_route.found = audio.output_route.writable = 1;
+    audio.output_route.info.type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
+    audio.output_route.info.count = 1;
+    audio.output_route.info.value.enumerated.items = 3;
+    snprintf(audio.output_route.name, sizeof(audio.output_route.name),
+             "Output Route");
+    codec_raw = 0; codec_writes = 0;
+    codec_enum = 1; enum_raw = -1; enum_writes = 0;
+    item = enum_item_index(&audio, &audio.output_route, "Speaker");
+    require_condition(item == 2, "Speaker route resolved at a nonzero item");
+    require_condition(write_raw_control(&audio, &audio.output_route, item) == 0 &&
+                      enum_writes == 1 && enum_raw == 2,
+                      "Speaker route written at its item index");
+    codec_enum = 0;
+}
+
+/* Every ADC has its own PGA capture volume; a gain change has to reach all of
+ * them or one lane stays about 26 dB hotter than the rest. */
+static void test_codec_pga_gain(void)
+{
+    static const long ranges[][2] = { {0, 50}, {0, 100}, {0, 200}, {0, 40} };
+    struct audio_hw audio;
+    int i;
+
+    memset(&audio, 0, sizeof(audio));
+    fixture_codec(&audio);
+    audio.codec_volume_count = 4;
+    for (i = 0; i < 4; ++i) {
+        audio.codec_volumes[i].found = audio.codec_volumes[i].writable = 1;
+        audio.codec_volumes[i].info.type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+        audio.codec_volumes[i].info.value.integer.min = ranges[i][0];
+        audio.codec_volumes[i].info.value.integer.max = ranges[i][1];
+        audio.codec_volumes[i].info.count = 1;
+        snprintf(audio.codec_volumes[i].name,
+                 sizeof(audio.codec_volumes[i].name),
+                 "PGA Capture Volume %d", i);
+    }
+    codec_writes = 0; codec_log_count = 0;
+    require_condition(audio_set_gain(&audio, 50) == 0,
+                      "owner gain applied through the per-codec path");
+    require_condition(codec_writes == 4 && codec_log_count == 4,
+                      "every codec PGA received the gain");
+    require_condition(codec_log[0] == 25 && codec_log[1] == 50 &&
+                      codec_log[2] == 100 && codec_log[3] == 20,
+                      "each PGA written at its own scale");
+    require_condition(audio.gain == 50, "reported gain follows the hardware");
 }
 
 static void test_logical_restart_input(void)
@@ -1224,6 +1328,9 @@ int main(void)
     wait_for_exit(pid);
 
     test_physical_reference_range();
+    test_lidar_speaker_levels();
+    test_lidar_output_route_enum();
+    test_codec_pga_gain();
     test_startup_runtime_and_reference();
     test_startup_retry_cadence();
     test_restart_precedence();
