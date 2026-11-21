@@ -1354,12 +1354,18 @@ static void hardware_detect(struct hardware *hw, int force_stub)
         return;
     }
 
-    detect_sysfs(hw);
-    if (hw->kind == HW_SYSFS)
-        return;
-
+    /*
+     * The Lidar exposes both a per-LED-class RGB sysfs driver and the
+     * IS31FL3236 frame interface.  The sysfs backend averages the 12-pixel
+     * ring into one logical LED, so probe the controller first and fall back
+     * to sysfs only on boards that do not publish frame/boot_animation.
+     */
     detect_is31(hw);
     if (hw->kind == HW_IS31FL3236)
+        return;
+
+    detect_sysfs(hw);
+    if (hw->kind == HW_SYSFS)
         return;
 
     if (detect_i2c()) {
