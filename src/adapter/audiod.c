@@ -159,17 +159,25 @@ struct snd_ctl_elem_value {
 /*
  * Wake acknowledgement chirp.
  *
- * Short and quiet on purpose.  It is an acknowledgement, not an alert: it
- * has to be audible across a room without being startling at night, and it
- * has to finish well before the speaker starts talking, because the same
- * audio is captured by the microphone and only the echo canceller keeps it
- * out of the transcript.  90ms of a rising two-tone pair is enough to be
- * recognised as "I heard you" and short enough not to overlap a command.
+ * Short, and paced as an acknowledgement rather than an alert: 90ms of a
+ * rising two-tone pair is enough to be recognised as "I heard you" and short
+ * enough not to overlap a command.  The same generator also carries the
+ * button, mute and timer/alarm cues, so this amplitude is every generated
+ * notification the device makes.
+ *
+ * The level is a peak in S16 units.  LE_CHIRP_AMPLITUDE_LIDAR peaks at
+ * -6 dBFS (-9 dBFS sine RMS), which puts a short cue just above typical
+ * mastered music (-14 dBFS RMS), so a press at a volume step is heard at
+ * about that step's music level; the 6 dB below full scale leaves source
+ * headroom, so a cue and ducked music still sum well below the -12 dB master
+ * cap and the -6 dB LO gain.  MT8163 has no such taper and keeps the quieter
+ * LE_CHIRP_AMPLITUDE.  The ramp at both ends keeps the attack from clicking.
  */
 #define LE_CHIRP_MS 90
 #define LE_CHIRP_LOW_HZ 880.0
 #define LE_CHIRP_HIGH_HZ 1320.0
 #define LE_CHIRP_AMPLITUDE 4200.0
+#define LE_CHIRP_AMPLITUDE_LIDAR 16384.0
 
 /*
  * Cue rate limit.
@@ -1343,8 +1351,9 @@ static void apply_persisted_levels(struct audio_hw *audio)
 }
 
 /* Amazon's Lidar boot sequence starts the speaker at -40 dB.  The engine's
- * logical taper, -12 - 48 * (1 - x)^1.3 dB, reaches that at 35%, so first
- * boot is quiet instead of the MT8163 default's 50%. */
+ * logical taper, -12 - 48 * (1 - x)^1.3 dB, reaches that level in the lower
+ * third of the scale, so LE_LIDAR_DEFAULT_VOLUME starts first boot quiet
+ * instead of at the MT8163 default volume. */
 #define LE_LIDAR_DEFAULT_VOLUME 35
 
 static int default_master_volume(void)
@@ -1881,6 +1890,8 @@ static int write_chirp_fd(int fd, double first_hz, double second_hz,
     size_t total = (size_t)LE_PCM_RATE * ms / 1000U;
     size_t done = 0;
     double phase = 0.0;
+    double amplitude = audio_profile_lidar ? LE_CHIRP_AMPLITUDE_LIDAR
+                                           : LE_CHIRP_AMPLITUDE;
 
     while (done < total) {
         size_t frames = total - done < LE_TONE_CHUNK_FRAMES
@@ -1905,7 +1916,7 @@ static int write_chirp_fd(int fd, double first_hz, double second_hz,
                 ramp = (double)index / (double)edge;
             else if (index + edge > total)
                 ramp = (double)(total - index) / (double)edge;
-            value = (int16_t)(sin(phase) * LE_CHIRP_AMPLITUDE * ramp);
+            value = (int16_t)(sin(phase) * amplitude * ramp);
             phase += 2.0 * 3.14159265358979323846 * hz /
                      (double)LE_PCM_RATE;
             if (phase >= 2.0 * 3.14159265358979323846)
