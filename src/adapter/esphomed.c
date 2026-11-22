@@ -180,7 +180,12 @@ static int mic_muted(void){return S.local_mute_gate||S.muted||S.privacy!=0||!S.l
  * the ring pulsing the error colour indefinitely. Colours are ledd's default
  * themes; brightness follows the user's theme. Errors flash briefly and expire;
  * idle releases only this owner, leaving the saved ring settings untouched. */
-static void profile(const char *name){char a[192];if(!strcmp(name,"idle")){(void)job(S.led_path,"pattern","{\"name\":\"stop\",\"owner\":\"esphome\"}",0,0);return;}
+/* waked's red wake pulse is only a previous-owner entry to ledd, which
+ * restores it when esphome's pattern stops, so the ring turned red again
+ * seconds after the reply. The HA turn owns the ring from listening on, so
+ * release that owner outright (voice_listening_led.c does the same). */
+static void wake_stop(void){static const char a[]="{\"name\":\"stop\",\"owner\":\"wakeword\"}";(void)job(S.led_path,"pattern",a,0,0);}
+static void profile(const char *name){char a[192];if(!strcmp(name,"idle")){(void)job(S.led_path,"pattern","{\"name\":\"stop\",\"owner\":\"esphome\"}",0,0);wake_stop();return;}
  int error=!strcmp(name,"error");unsigned r=72,g=185,b=255;if(!strcmp(name,"thinking")){r=168;g=115;b=239;}else if(error){r=239;g=80;b=80;}
  snprintf(a,sizeof a,"{\"name\":\"%s\",\"r\":%u,\"g\":%u,\"b\":%u,\"brightness\":100,\"repeats\":%d,\"profile\":\"%s\",\"owner\":\"esphome\"}",error?"flash":"pulse",r,g,b,error?3:0,name);(void)job(S.led_path,"pattern",a,0,0);}
 static void light_state(struct client *c){unsigned char b[16];struct ep_writer w={b,sizeof b,0,0};float f=(float)(S.lux<0?0:S.lux);uint32_t bits;memcpy(&bits,&f,4);ep_fixed32(&w,1,LIGHT_KEY);ep_fixed32(&w,2,bits);if(S.lux<0)ep_uint(&w,3,1);(void)send_writer(c,25,&w);}
@@ -342,7 +347,7 @@ static int voice_start(uint64_t sample,int continued){unsigned char b[256];struc
     already detected here, so HA must start at STT -- with no HA wake engine the
     run otherwise fails instantly with wake-engine-missing. */
  ep_uint(&w,3,1);if(!continued)ep_string(&w,5,"Alexa");if(send_writer(&S.clients[S.owner],90,&w))return -1;
- S.capture_next=sample>3200?sample-3200:0;if(S.capture_next<S.ring_first)S.capture_next=S.ring_first;S.turn=1;S.turn_deadline=S.now+S.turn_limit;S.continue_turn=S.run_end=S.early_tts=S.tts_done=0;S.tts_url[0]=S.next_url[0]=0;S.announcement=0;S.pipeline=1;S.voice_open=1;if(!continued)event_send(ACTIVITY_VOICE_KEY,"wake_word");event_send(ACTIVITY_VOICE_KEY,"listening");profile("listening");status_write();return 0;
+ S.capture_next=sample>3200?sample-3200:0;if(S.capture_next<S.ring_first)S.capture_next=S.ring_first;S.turn=1;S.turn_deadline=S.now+S.turn_limit;S.continue_turn=S.run_end=S.early_tts=S.tts_done=0;S.tts_url[0]=S.next_url[0]=0;S.announcement=0;S.pipeline=1;S.voice_open=1;if(!continued)event_send(ACTIVITY_VOICE_KEY,"wake_word");event_send(ACTIVITY_VOICE_KEY,"listening");profile("listening");wake_stop();status_write();return 0;
 }
 /* Server-side wake (esphome_server_wake, off by default): open an ESPHome run with
  * USE_VAD|USE_WAKE_WORD and no phrase, then stream the mic continuously so Home

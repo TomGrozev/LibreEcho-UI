@@ -157,6 +157,17 @@ assert call("status")["pattern_active"] is False
 call("pattern", {"name": "pulse", "owner": "bluetooth"})
 call("set_colour", {"r": 1, "g": 2, "b": 3})
 assert call("status")["pattern_active"] is False
+# The esphome turn takes the ring from the wake indicator. Releasing the
+# wakeword owner must clear it from ledd's restore slot, otherwise the idle
+# stop at the end of the turn brings the red wake pulse back.
+call("pattern", {"name": "pulse", "owner": "wakeword"})
+assert call("status")["pattern_owner"] == "wakeword"
+call("pattern", {"name": "pulse", "r": 72, "g": 185, "b": 255,
+                 "owner": "esphome"})
+call("pattern", {"name": "stop", "owner": "wakeword"})
+call("pattern", {"name": "stop", "owner": "esphome"})
+handover = call("status")
+assert handover["pattern_active"] is False, handover
 PY
 
 echo "LED owner-scoped override and restore: ok"

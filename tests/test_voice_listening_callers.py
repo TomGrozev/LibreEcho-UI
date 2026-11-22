@@ -43,7 +43,9 @@ class SilentWake(Fixture):
         self.assertFalse(any(req['cmd'] == 'cue' for req in self.adapters['audio'].calls))
         # The ended turn's indicator must expire on its own: a finite flash or an
         # owner release, never an open-ended breathing animation.
-        ended = self.wait_call('led', 'pattern', 3)['args']
+        # The turn first releases the wakeword owner (a separate stop) and then
+        # releases its own indicator, so the ended-turn call is the next one.
+        ended = self.wait_call('led', 'pattern', 4)['args']
         self.assertEqual(ended['owner'], 'esphome')
         self.assertTrue(ended['name'] == 'stop' or (ended['name'] == 'flash' and 0 < ended['repeats'] <= 5), ended)
         self.assertFalse(any(req['cmd'] == 'animate' for req in self.adapters['led'].calls))
