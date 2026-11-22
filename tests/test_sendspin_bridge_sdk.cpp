@@ -303,12 +303,92 @@ void test_feedback_pair_is_the_played_cursor_finish() {
     BRIDGE_CHECK(listener.reported_frames() == kHw,
                  "cumulative reported frames == engine played cursor");
 
-    // Invalid timing must never fabricate a report.
+    // With no new played frames there is nothing to report, whether or not the
+    // engine publishes a horizon.
     BRIDGE_CHECK(server.with_sink([&](le_audio_sink* sink) {
         le_audio_sink_note_timing(sink, epoch, gen,
                                   LE_AUDIO_SINK_PROGRESS_TIMING_INVALID, 0);
     }), "invalidate timing");
-    BRIDGE_CHECK(!listener.pump_feedback(), "no report without valid timing");
+    BRIDGE_CHECK(!listener.pump_feedback(),
+                 "no report for an unchanged played cursor");
+
+    session.disconnect();
+    server.stop();
+}
+
+// An engine whose speaker chain is not calibrated refuses to forecast a finish,
+// so PROGRESS carries played frames with no horizon. The companion must still
+// report the played prefix or the SDK never clears initial_decode and sends
+// priming silence forever.
+void test_uncalibrated_engine_still_reports_progress() {
+    const std::string path = unique_socket_path("brdg");
+    EngineServer server;
+    BRIDGE_CHECK(server.start(path), "engine server start");
+
+    EngineSinkSession session(make_session_config(path));
+    BRIDGE_CHECK(session.start_stream() == SinkResult::Ok, "session OPEN gen1");
+
+    SendspinClientConfig cfg;
+    cfg.name = "LibreEcho bridge uncalibrated";
+    SendspinClient client(std::move(cfg));
+    PlayerRole& player = client.add_player(make_pcm_player_config());
+    SdkPlayerListener listener(session, &player);
+    listener.on_stream_start();
+
+    const size_t kFrames = 2048;
+    std::vector<int16_t> pcm = ramp_pcm(kFrames, 0);
+    const size_t accepted =
+        listener.on_audio_write(reinterpret_cast<uint8_t*>(pcm.data()),
+                                kFrames * kFrameBytes, 1000);
+    BRIDGE_CHECK(accepted == kFrames * kFrameBytes,
+                 "engine acknowledged all offered frames");
+
+    const uint32_t epoch = session.epoch();
+    const uint32_t gen = session.generation();
+    const size_t kHw = 1024;
+    const uint64_t kPlayed = 768;
+    // Exactly what the real engine sends for an unmeasured chain: the playhead
+    // advances, the horizon stays explicitly INVALID.
+    BRIDGE_CHECK(server.with_sink([&](le_audio_sink* sink) {
+        int16_t scratch[LE_AUDIO_SINK_MAX_DATA_FRAMES * 2];
+        uint64_t first = 0;
+        if (le_audio_sink_render(sink, scratch, kHw, &first) != kHw) return;
+        le_audio_sink_commit(sink, epoch, gen, kHw);
+        le_audio_sink_note_playhead(sink, epoch, gen, kPlayed);
+        le_audio_sink_note_timing(sink, epoch, gen,
+                                  LE_AUDIO_SINK_PROGRESS_TIMING_INVALID, 0);
+    }), "inject uncalibrated engine progress");
+
+    EngineSinkTiming t{};
+    BRIDGE_CHECK(session.poll(&t) == SinkResult::Ok && !t.valid &&
+                     t.finish_us == 0 && t.played_frames == kPlayed,
+                 "engine published a played cursor with no horizon");
+
+    const auto before = std::chrono::steady_clock::now();
+    BRIDGE_CHECK(listener.pump_feedback(),
+                 "played frames reported even without an engine forecast");
+    const auto after = std::chrono::steady_clock::now();
+    const int64_t before_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  before.time_since_epoch())
+                                  .count();
+    const int64_t after_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 after.time_since_epoch())
+                                 .count();
+    BRIDGE_CHECK(listener.last_report_frames() == kPlayed,
+                 "reported exactly the played-frame delta");
+    BRIDGE_CHECK(listener.last_report_timestamp_us() >= before_us &&
+                     listener.last_report_timestamp_us() <= after_us,
+                 "stamped with the local sample time, a true finish bound");
+
+    // Progress continues to be reported as the cursor advances, so the SDK's
+    // buffered-frames accounting keeps draining after initial_decode clears.
+    BRIDGE_CHECK(server.with_sink([&](le_audio_sink* sink) {
+        le_audio_sink_note_playhead(sink, epoch, gen, kHw);
+    }), "advance playhead without a horizon");
+    BRIDGE_CHECK(listener.pump_feedback(), "second report without a forecast");
+    BRIDGE_CHECK(listener.report_count() == 2 &&
+                     listener.reported_frames() == kHw,
+                 "cumulative reported frames follow the played cursor");
 
     session.disconnect();
     server.stop();
@@ -884,6 +964,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "test_sendspin_bridge_sdk: real SDK <-> real engine bridge\n");
     test_feedback_pair_is_the_played_cursor_finish();
+    test_uncalibrated_engine_still_reports_progress();
     test_natural_tail_is_reported_exactly_once();
     test_timing_arithmetic_bounds();
     test_server_mute_is_source_only_and_ramped();

@@ -45,6 +45,12 @@
  *   generation, so the last frames played are reported as the cursor reaches the
  *   exact tail.
  *
+ *   When the engine publishes no finish forecast at all (an unmeasured speaker
+ *   chain keeps its timing uncalibrated), the played prefix is still reported,
+ *   stamped with the local sample time as an upper bound. Suppressing the report
+ *   instead deadlocks the SDK (initial_decode only clears on a nonzero played
+ *   count), which is what keeps the Lidar silent.
+ *
  * This header has the SDK dependency and is compiled only by the companion's
  * own opt-in target, never by the C99 daemon or the dependency-free suite.
  */
@@ -237,7 +243,6 @@ public:
         }
         EngineSinkTiming timing{};
         if (session_.poll(&timing) != SinkResult::Ok) return false;
-        if (!timing.valid || timing.finish_us == 0) return false;  // never fabricate
         // A physically played tail may have its CREDIT held for the SDK's
         // identical retry. Report only the known acknowledged source prefix;
         // derive that prefix's finish time from the same engine endpoint.
@@ -246,7 +251,17 @@ public:
         const uint64_t delta = timing.played_frames - reported_frames_;
         if (delta == 0) return false;
         int64_t finish_us = 0;
-        if (!derive_played_finish_us(timing, &finish_us)) return false;
+        if (timing.valid && timing.finish_us != 0) {
+            if (!derive_played_finish_us(timing, &finish_us)) return false;
+        } else {
+            // The engine reports TIMING_INVALID while its speaker chain's output
+            // latency is unmeasured. Refusing the report too would deadlock the
+            // SDK: initial_decode only clears on a nonzero played count, so it
+            // would send priming silence forever and no announcement would open
+            // the sink. Report the played prefix with the sample time as its
+            // finish, the only honest bound available.
+            finish_us = now_monotonic_us();
+        }
         if (finish_us < last_report_timestamp_us_) return false;  // never regress
         const uint64_t chunk =
             std::min<uint64_t>(delta, static_cast<uint64_t>(UINT32_MAX));
@@ -276,6 +291,12 @@ public:
     bool streaming() const { std::lock_guard<std::recursive_mutex> guard(mu_); return session_.streaming(); }
 
 private:
+    // CLOCK_MONOTONIC microseconds, the domain the engine's finish_us uses.
+    static int64_t now_monotonic_us() {
+        return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count());
+    }
     size_t write_locked(uint8_t* data, size_t length, uint32_t timeout_ms, bool* full) {
         std::lock_guard<std::recursive_mutex> guard(mu_);
         if (!session_.streaming()) return 0;
