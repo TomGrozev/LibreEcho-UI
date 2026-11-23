@@ -88,8 +88,9 @@ static void wav_boundaries(void){
  put32(b+4,51);expect_stream(b,52,-1,"finite RIFF size mismatch");
  put32(b+4,UINT32_MAX);expect_stream(b,52,0,"completed sentinel RIFF with finite data");
  put32(b+40,UINT32_MAX);expect_stream(b,52,0,"completed RIFF/data nonseekable sentinels");
+ put32(b+40,0);expect_stream(b,52,0,"zero data size means until EOF");
  put32(b+4,44);expect_stream(b,52,0,"exact finite RIFF with sentinel data");
- put32(b+4,UINT32_MAX);put32(b+40,UINT32_MAX-1);expect_stream(b,52,-1,"only exact data sentinel is supported");
+ put32(b+4,UINT32_MAX);put32(b+40,UINT32_MAX-1);expect_stream(b,52,-1,"only sentinel or zero data sizes run to EOF");
  put32(b+40,10);expect_stream(b,52,-1,"sentinel RIFF cannot hide truncated finite data");
  put32(b+40,UINT32_MAX);expect_stream(b,51,-1,"sentinel data must end on a PCM sample boundary");
  b[22]=2;b[32]=4;expect_stream(b,50,-1,"sentinel stereo data must end on a PCM frame boundary");b[22]=1;b[32]=2;

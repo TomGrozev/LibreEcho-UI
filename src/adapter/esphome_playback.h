@@ -4,7 +4,6 @@
 #include <stddef.h>
 #include <netinet/in.h>
 #include <mbedtls/ssl.h>
-#include <mbedtls/x509_crt.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
 #include "radio_resample.h"
@@ -36,7 +35,7 @@ struct esp_playback {
   * decoder, bytes of a replayed body still to skip, and its first bytes to compare. */
  struct in_addr addr;int have_addr;unsigned reconnects;size_t delivered,resume_skip,head_n;uint64_t progress_at;unsigned char head[64];
  mp3dec_t decoder;struct le_radio_resampler resampler;
- mbedtls_ssl_context ssl;mbedtls_ssl_config config;mbedtls_x509_crt ca;mbedtls_entropy_context entropy;mbedtls_ctr_drbg_context rng;
+ mbedtls_ssl_context ssl;mbedtls_ssl_config config;mbedtls_entropy_context entropy;mbedtls_ctr_drbg_context rng;
 };
 void esp_playback_init(struct esp_playback *);
 void esp_playback_close(struct esp_playback *);

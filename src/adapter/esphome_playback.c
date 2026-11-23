@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <mbedtls/platform_util.h>
+#include <mbedtls/x509_crt.h>
 /* Streaming reply player. The response body is unframed into a fixed window
  * and decoded while it arrives: Home Assistant opens its TTS stream once the
  * LLM has written about 60 characters, so the reply starts while the rest is
@@ -48,8 +49,14 @@ enum{CHUNK_SIZE,CHUNK_SIZE_EXT,CHUNK_SIZE_LF,CHUNK_DATA,CHUNK_DATA_CR,CHUNK_DATA
 static unsigned u16(const unsigned char *p){return p[0]|((unsigned)p[1]<<8);}
 static uint32_t u32(const unsigned char *p){return u16(p)|((uint32_t)u16(p+2)<<16);}
 static unsigned be16(const unsigned char *p){return ((unsigned)p[0]<<8)|p[1];}
-void esp_playback_init(struct esp_playback *p){memset(p,0,sizeof *p);p->fd=p->bus_fd=p->dns_fd=-1;mbedtls_ssl_init(&p->ssl);mbedtls_ssl_config_init(&p->config);mbedtls_x509_crt_init(&p->ca);mbedtls_entropy_init(&p->entropy);mbedtls_ctr_drbg_init(&p->rng);}
-void esp_playback_close(struct esp_playback *p){if(p->fd>=0)close(p->fd);if(p->bus_fd>=0)close(p->bus_fd);if(p->dns_fd>=0)close(p->dns_fd);mbedtls_ssl_free(&p->ssl);mbedtls_ssl_config_free(&p->config);mbedtls_x509_crt_free(&p->ca);mbedtls_ctr_drbg_free(&p->rng);mbedtls_entropy_free(&p->entropy);p->fd=p->bus_fd=p->dns_fd=-1;p->state=0;}
+/* The bundle is a few hundred kilobytes of PEM; parsing it per reply is a
+ * visible slice of a turn on a 1 GHz A35. esphomed is single threaded and
+ * keeps the parsed chain for the whole process, so one chain is enough. */
+static mbedtls_x509_crt playback_ca;
+static int playback_ca_state;
+static int ca_load(const char *path){if(playback_ca_state==1)return 0;mbedtls_x509_crt_init(&playback_ca);if(mbedtls_x509_crt_parse_file(&playback_ca,path)){mbedtls_x509_crt_free(&playback_ca);return -1;}playback_ca_state=1;return 0;}
+void esp_playback_init(struct esp_playback *p){memset(p,0,sizeof *p);p->fd=p->bus_fd=p->dns_fd=-1;mbedtls_ssl_init(&p->ssl);mbedtls_ssl_config_init(&p->config);mbedtls_entropy_init(&p->entropy);mbedtls_ctr_drbg_init(&p->rng);}
+void esp_playback_close(struct esp_playback *p){if(p->fd>=0)close(p->fd);if(p->bus_fd>=0)close(p->bus_fd);if(p->dns_fd>=0)close(p->dns_fd);mbedtls_ssl_free(&p->ssl);mbedtls_ssl_config_free(&p->config);mbedtls_ctr_drbg_free(&p->rng);mbedtls_entropy_free(&p->entropy);p->fd=p->bus_fd=p->dns_fd=-1;p->state=0;}
 static int tls_send(void *ctx,const unsigned char *buf,size_t n){int fd=*(int*)ctx;ssize_t w=send(fd,buf,n,MSG_DONTWAIT|MSG_NOSIGNAL);if(w<0&&(errno==EAGAIN||errno==EWOULDBLOCK))return MBEDTLS_ERR_SSL_WANT_WRITE;return w<0?MBEDTLS_ERR_SSL_INTERNAL_ERROR:(int)w;}
 static int tls_recv(void *ctx,unsigned char *buf,size_t n){int fd=*(int*)ctx;ssize_t w=recv(fd,buf,n,MSG_DONTWAIT);if(w<0&&(errno==EAGAIN||errno==EWOULDBLOCK))return MBEDTLS_ERR_SSL_WANT_READ;return w<0?MBEDTLS_ERR_SSL_INTERNAL_ERROR:(int)w;}
 static int connect_ip(struct esp_playback *p,struct in_addr ip){struct sockaddr_in a;p->addr=ip;p->have_addr=1;memset(&a,0,sizeof a);a.sin_family=AF_INET;a.sin_port=htons((uint16_t)p->port);a.sin_addr=ip;p->fd=socket(AF_INET,SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0);if(p->fd<0)return -1;if(connect(p->fd,(struct sockaddr*)&a,sizeof a)<0&&errno!=EINPROGRESS)return -1;p->state=2;return 0;}
@@ -82,7 +89,7 @@ int esp_playback_start(struct esp_playback *p,const char *url,const char *bus,co
  /* Best effort now, so the output can warm up during the fetch; audio retries and fails without it. */
  (void)bus_open(p);
  int n=snprintf(p->request,sizeof p->request,"GET %s HTTP/1.1\r\nHost: %s:%u\r\nConnection: close\r\nAccept: audio/wav, audio/mpeg\r\n\r\n",p->path,p->host,p->port);if(n<0||(size_t)n>=sizeof p->request)return -1;p->request_len=(size_t)n;p->expected=SIZE_MAX;p->deadline=now+TOTAL_MS;p->progress_at=now;p->idle_deadline=now+IDLE_MS;p->buffering=1;
- if(p->tls){preroll(p,now);if(!ca)ca="/etc/ssl/certs/ca-certificates.crt";if(mbedtls_x509_crt_parse_file(&p->ca,ca)||mbedtls_ctr_drbg_seed(&p->rng,mbedtls_entropy_func,&p->entropy,(const unsigned char*)"libreecho-https",14)||mbedtls_ssl_config_defaults(&p->config,MBEDTLS_SSL_IS_CLIENT,MBEDTLS_SSL_TRANSPORT_STREAM,MBEDTLS_SSL_PRESET_DEFAULT))return -1;mbedtls_ssl_conf_authmode(&p->config,MBEDTLS_SSL_VERIFY_REQUIRED);mbedtls_ssl_conf_ca_chain(&p->config,&p->ca,NULL);mbedtls_ssl_conf_rng(&p->config,mbedtls_ctr_drbg_random,&p->rng);if(mbedtls_ssl_setup(&p->ssl,&p->config)||mbedtls_ssl_set_hostname(&p->ssl,p->host))return -1;mbedtls_ssl_set_bio(&p->ssl,&p->fd,tls_send,tls_recv,NULL);}
+ if(p->tls){preroll(p,now);if(!ca)ca="/etc/ssl/certs/ca-certificates.crt";if(ca_load(ca)||mbedtls_ctr_drbg_seed(&p->rng,mbedtls_entropy_func,&p->entropy,(const unsigned char*)"libreecho-https",14)||mbedtls_ssl_config_defaults(&p->config,MBEDTLS_SSL_IS_CLIENT,MBEDTLS_SSL_TRANSPORT_STREAM,MBEDTLS_SSL_PRESET_DEFAULT))return -1;mbedtls_ssl_conf_authmode(&p->config,MBEDTLS_SSL_VERIFY_REQUIRED);mbedtls_ssl_conf_ca_chain(&p->config,&playback_ca,NULL);mbedtls_ssl_conf_rng(&p->config,mbedtls_ctr_drbg_random,&p->rng);if(mbedtls_ssl_setup(&p->ssl,&p->config)||mbedtls_ssl_set_hostname(&p->ssl,p->host))return -1;mbedtls_ssl_set_bio(&p->ssl,&p->fd,tls_send,tls_recv,NULL);}
  if(inet_pton(AF_INET,p->host,&ip)==1)return connect_ip(p,ip);return dns_start(p);
 }
 static int headers(struct esp_playback *p){size_t i;for(i=0;i+3<p->wire_n&&i<8192;i++)if(!memcmp(p->wire+i,"\r\n\r\n",4))break;if(i+3>=p->wire_n)return p->wire_n>=8192?-1:0;
@@ -163,7 +170,10 @@ static int wav_chunks(struct esp_playback *p){
   if(p->wav_stage==WAV_RIFF){if(n<12)return 0;if(memcmp(b,"RIFF",4)||memcmp(b+8,"WAVE",4))return -1;p->riff=u32(b+4);if(wav_take(p,12))return -1;p->wav_stage=WAV_CHUNK;continue;}
   if(n<8)return 0;
   uint32_t l=u32(b+4);
-  if(p->wav_stage==WAV_CHUNK&&!memcmp(b,"data",4)){if(!p->rate||(l!=UINT32_MAX&&l%(2U*(unsigned)p->channels)))return -1;if(wav_take(p,8))return -1;p->data_unbounded=l==UINT32_MAX;p->data_left=l;p->wav_stage=WAV_DATA;continue;}
+  if(p->wav_stage==WAV_CHUNK&&!memcmp(b,"data",4)){if(!p->rate||(l!=UINT32_MAX&&l%(2U*(unsigned)p->channels)))return -1;if(wav_take(p,8))return -1;
+   /* ffmpeg's non-seekable writer leaves 0xFFFFFFFF, or 0x0 for a size it
+    * could not patch back; both mean the samples run to the end of the body. */
+   p->data_unbounded=l==UINT32_MAX||!l;p->data_left=l;p->wav_stage=WAV_DATA;continue;}
   if(l==UINT32_MAX)return -1;
   if(p->wav_stage==WAV_CHUNK&&!memcmp(b,"fmt ",4)){const unsigned char *f=b+8;unsigned channels;uint32_t rate;if(p->rate||l<16||l>64)return -1;if(n<8+(size_t)l)return 0;channels=u16(f+2);rate=u32(f+4);
    if(u16(f)!=1||u16(f+14)!=16||channels<1||channels>2||rate<8000||rate>48000||u16(f+12)!=channels*2)return -1;p->channels=(int)channels;p->rate=(int)rate;if(wav_take(p,8+(size_t)l))return -1;p->skip=l&1;continue;}
