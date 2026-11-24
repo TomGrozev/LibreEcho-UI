@@ -985,6 +985,7 @@ includes the persisted `listening` object and the latest bounded restart state:
   "noise_suppression": false,
   "restart": {
     "state": "ready",
+    "phase": "",
     "error": ""
   }
 }
@@ -1031,11 +1032,18 @@ voice. There is no legacy satellite selector or compatibility state.
 
 On Linux, activation is a bounded tracked restart job without blocking normal
 APIs. The accepted response is `202` with `restart.state: "pending"`; a second
-voice update while pending receives `409`. Poll GET for completion. A failed
-transition restores persisted voice intent and the prior running service graph,
-then reports `failed` with a nonempty `restart.error`. Rollback failure is
-reported explicitly. The next PUT acknowledges the completed failure with `503`.
-HA activation is rejected with `501` if `libreecho-esphomed` is not installed.
+voice update while pending receives `409`. Poll GET for completion. While
+pending, `restart.phase` is `starting` for the requested pipeline and
+`rolling-back` after a failed start; it is empty when no transition is pending.
+A read-only GET never starts a rollback; the once-a-second server tick does. The
+job has a 120-second overall deadline, above the assistant daemon's dependency
+wait, so a healthy slow start is not cut off while a wedged one is. A deadline
+stops the init script's process group before the transition moves on, and
+`restart.error` then reports that the transition timed out. A failed transition
+restores persisted voice intent and the prior running service graph, then
+reports `failed` with a nonempty `restart.error`. Rollback failure is reported
+explicitly. The next PUT acknowledges the completed failure with `503`. HA
+activation is rejected with `501` if `libreecho-esphomed` is not installed.
 
 The response always includes:
 
@@ -3323,7 +3331,7 @@ The `mqtt` entry stores a setting only: the image has no MQTT client yet, so the
     "home_assistant": { "ready": true },
     "stt": { "engine": "sherpa", "reachable": false },
     "tts": { "engine": "sherpa", "reachable": false },
-    "restart": { "state": "pending", "error": "" }
+    "restart": { "state": "pending", "phase": "starting", "error": "" }
   },
   "error": null
 }

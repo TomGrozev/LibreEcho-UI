@@ -113,6 +113,89 @@ int le_service_group_is_live(pid_t pgid)
     return live;
 }
 
+long long le_service_monotonic_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return 0;
+    return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+void le_service_group_terminate(pid_t pgid)
+{
+    struct timespec tick = { 0, 100000000L };   /* 100 ms */
+    int polls;
+
+    if (pgid <= 0)
+        return;
+    /* A negative pid addresses the process group whose id is its absolute
+       value. The plain signal that follows covers a group that was never
+       created (kill(-pgid) would then have no target). */
+    (void)kill(-pgid, SIGTERM);
+    (void)kill(pgid, SIGTERM);
+    for (polls = 0; polls < 10 && le_service_group_is_live(pgid); ++polls)
+        (void)nanosleep(&tick, NULL);
+    if (le_service_group_is_live(pgid)) {
+        (void)kill(-pgid, SIGKILL);
+        (void)kill(pgid, SIGKILL);
+        for (polls = 0; polls < 10 && le_service_group_is_live(pgid); ++polls)
+            (void)nanosleep(&tick, NULL);
+    }
+}
+
+/* 0 when the child was reaped, 1 on the deadline, -1 on a wait failure. */
+static int wait_until(pid_t child, int *status, long long deadline)
+{
+    struct timespec tick = { 0, 50000000L };   /* 50 ms */
+
+    for (;;) {
+        pid_t done = waitpid(child, status, WNOHANG);
+
+        if (done == child)
+            return 0;
+        if (done < 0 && errno != EINTR)
+            return -1;
+        if (le_service_monotonic_ms() >= deadline)
+            return 1;
+        (void)nanosleep(&tick, NULL);
+    }
+}
+
+int le_service_command_timeout(const char *path, const char *const *argv,
+                               unsigned int timeout_ms)
+{
+    long long deadline;
+    pid_t child;
+    int status;
+
+    if (!path || !path[0] || !argv || !timeout_ms)
+        return -1;
+    deadline = le_service_monotonic_ms() + (long long)timeout_ms;
+    child = fork();
+    if (child < 0)
+        return -1;
+    if (child == 0) {
+        (void)setpgid(0, 0);
+        le_service_env_isolate();
+        execv(path, (char *const *)argv);
+        _exit(127);
+    }
+    /* Also set the group in the parent: the child may not have run setpgid()
+       yet when the deadline passes, and kill(-child) would miss the script. */
+    (void)setpgid(child, child);
+    if (wait_until(child, &status, deadline) == 0)
+        return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    /* The deadline is enforced here, inside the caller's own child, and the
+       script's group is stopped and reaped before this returns. A tracked
+       restart can therefore never exit and leave a lifecycle script running
+       for the caller's rollback to race. */
+    le_service_group_terminate(child);
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+        continue;
+    return -1;
+}
+
 int le_service_command(const char *path, const char *const *argv)
 {
     pid_t child;

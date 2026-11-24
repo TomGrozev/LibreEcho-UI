@@ -6879,6 +6879,15 @@
        "failed"
       ]
      },
+     "phase": {
+      "type": "string",
+      "description": "Which half of a pending transition is running: starting the requested pipeline, or rolling back to the previous one.",
+      "enum": [
+       "",
+       "starting",
+       "rolling-back"
+      ]
+     },
      "error": {
       "type": "string"
      }

@@ -5,6 +5,12 @@ set -eu
 grep -q 'voice_pipeline_restart_pid' src/api.c
 grep -q 'waitpid(voice_pipeline_restart_pid, &status, WNOHANG)' src/api.c
 grep -q 'voice_pipeline_restart_pending' src/api.c
+grep -q 'voice_pipeline_restart_advance(0)' src/api.c
+grep -q 'voice_pipeline_restart_phase' src/api.c
+grep -q 'rolling-back' src/api.c
+grep -q 'void api_tick' src/api.c src/api.h
+grep -q 'api_tick(api)' src/http_server.c
+grep -q '"phase"' docs/API.md web/openapi.json
 grep -q 'r->status = 202' src/api.c
 grep -q 'A voice pipeline restart is already in progress' src/api.c
 grep -q 'restart.state' docs/API.md web/openapi.json

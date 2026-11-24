@@ -83,6 +83,10 @@ void api_set_https_active(struct api_context*,int);
 void api_discovery_tick(struct api_context*);
 /* Records the plain HTTP listener so the advertisement names the right port. */
 void api_set_http_listener(struct api_context*,int port,int lan);
+/* Once-a-second server tick: reaps the tracked voice-pipeline restart and
+   starts its rollback after a failed forward transition. Never called from a
+   request path, so a GET stays read-only. */
+void api_tick(struct api_context*);
 int api_init(struct api_context*,struct le_backend*,int,int,const char*,const char*,const char*,const char*,const char*);int api_apply_persisted_configuration(struct api_context*,char*,size_t);int api_persist_configuration(struct api_context*);void api_log(struct api_context*,const char*,const char*);void api_handle(struct api_context*,const struct api_request*,struct api_response*);
 int api_diagnostics_kernel_authorize(struct api_context*,const struct api_request*,struct api_response*);int api_baby_monitor_stream_authorize(struct api_context*,const struct api_request*,struct api_response*,int*,int*,int*,int*,int*);
 size_t le_update_max_upload_bytes(void);

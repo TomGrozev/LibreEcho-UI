@@ -305,6 +305,25 @@ static int run_init_command(const char *path, const char *arg)
     argv[2] = NULL;
     return le_service_command(path, argv) ? LE_IO : LE_OK;
 }
+/* One init script under the voice restart's overall deadline. There is no
+ * per-command bound: agentd's `start` waits for its dependency sockets, and a
+ * fixed cap would kill a start that is merely slow. The script's own group is
+ * stopped by le_service_command_timeout when the deadline passes, before this
+ * tracked child can exit and let a rollback race it. */
+static int run_init_command_until(const char *path, const char *arg,
+                                  long long deadline)
+{
+    const char *argv[3];
+    long long remaining = deadline - le_service_monotonic_ms();
+
+    if (remaining <= 0)
+        return LE_IO;
+    argv[0] = path;
+    argv[1] = arg;
+    argv[2] = NULL;
+    return le_service_command_timeout(path, argv, (unsigned int)remaining)
+        ? LE_IO : LE_OK;
+}
 static int setup_startup_ready_valid(const char *path)
 {
     FILE *f;
@@ -454,6 +473,17 @@ static int valid_pipeline_token(const char *value)
 /* Only one pipeline restart may be outstanding. The child is deliberately
  * retained as a direct child so the parent can reap it and report failures;
  * detached workers cannot be bounded or observed by the API process. */
+#ifndef LE_VOICE_PIPELINE_RESTART_TIMEOUT_MS
+/* agentd's `start` may wait AGENT_DEPENDENCY_TIMEOUT_SECONDS (90 s) for its
+   dependency sockets (init/libreecho-agentd.init), so the job deadline sits
+   above it. */
+#define LE_VOICE_PIPELINE_RESTART_TIMEOUT_MS 120000
+#endif
+/* How long the tracked child gets to stop its own script group after the
+   deadline before the tick kills the child itself. le_service_command_timeout
+   spends up to two seconds there (SIGTERM grace, then SIGKILL); the tick must
+   not get there first or a rollback could start while a script is alive. */
+#define LE_VOICE_PIPELINE_RESTART_ESCALATE_MS 3000
 static pid_t voice_pipeline_restart_pid = -1;
 static int voice_pipeline_restart_result = LE_OK;
 /* Snapshot only voice-owned state. Restoring a whole api_context would lose
@@ -465,7 +495,11 @@ struct voice_transition_snapshot {
 };
 static struct voice_transition_snapshot voice_transition;
 static int voice_pipeline_rolling_back;
+static int voice_pipeline_rollback_needed;   /* forward failed; rollback not launched yet */
 static int voice_pipeline_rollback_failed;
+static int voice_pipeline_restart_timed_out;
+static long long voice_pipeline_restart_deadline_ms;
+static long long voice_pipeline_restart_escalate_ms;
 static int voice_pipeline_restart(const char *mode);
 static int esphome_satellite_ready(void);
 static void voice_transition_capture(struct api_context *c)
@@ -504,72 +538,137 @@ static void voice_transition_restore(void)
 }
 
 
-static int voice_pipeline_restart_reap(void)
+/*
+ * Move the tracked restart job forward without blocking.
+ *
+ * Collecting a finished child is safe from any request. Starting the rollback
+ * is not: it restores persisted intent and forks a second restart, so a request
+ * path must never do it. `allow_rollback` is 1 only in the once-a-second server
+ * tick, the single driver of a rollback.
+ */
+static int voice_pipeline_restart_advance(int allow_rollback)
 {
     int status;
     pid_t result;
+    long long now;
 
-    if (voice_pipeline_restart_pid <= 0)
-        return voice_pipeline_restart_result;
-    result = waitpid(voice_pipeline_restart_pid, &status, WNOHANG);
-    if (result == 0)
-        return LE_BUSY;
-    voice_pipeline_restart_pid = -1;
-    if (voice_pipeline_rolling_back) {
-        if(result<0||!WIFEXITED(status)||WEXITSTATUS(status)!=0)
-            voice_pipeline_rollback_failed=1;
-        voice_pipeline_rolling_back=0;
-        voice_transition.context=NULL;
-        return voice_pipeline_restart_result;
-    }
-    if (result < 0 || !WIFEXITED(status)) {
-        voice_pipeline_restart_result = LE_IO;
-    } else if (WEXITSTATUS(status) == 0) {
-        voice_pipeline_restart_result = LE_OK;
-    } else if (WEXITSTATUS(status) == 2) {
-        voice_pipeline_restart_result = LE_NOT_SUPPORTED;
-    } else {
-        voice_pipeline_restart_result = LE_IO;
-    }
-    if(voice_transition.context && voice_pipeline_restart_result!=LE_OK){
-        pid_t child;
-        voice_transition_restore();
-        if(persist_configuration(voice_transition.context)!=LE_OK){
-            voice_pipeline_rollback_failed=1;voice_transition.context=NULL;
+    if (voice_pipeline_restart_pid > 0) {
+        result = waitpid(voice_pipeline_restart_pid, &status, WNOHANG);
+        now = le_service_monotonic_ms();
+        if (result == 0) {
+            /* The child enforces the same deadline on its own script group,
+               so it normally exits just after it. Escalating is the backstop
+               for a child wedged outside a service command; give it the grace
+               it needs to stop that script group first. */
+            if (allow_rollback && voice_pipeline_restart_escalate_ms &&
+                now >= voice_pipeline_restart_escalate_ms) {
+                voice_pipeline_restart_timed_out = 1;
+                le_service_group_terminate(voice_pipeline_restart_pid);
+                voice_pipeline_restart_escalate_ms = 0;
+            }
+            return LE_BUSY;
+        }
+        if (result == voice_pipeline_restart_pid &&
+            voice_pipeline_restart_deadline_ms &&
+            now >= voice_pipeline_restart_deadline_ms)
+            voice_pipeline_restart_timed_out = 1;
+        voice_pipeline_restart_pid = -1;
+        voice_pipeline_restart_deadline_ms = 0;
+        voice_pipeline_restart_escalate_ms = 0;
+        if (voice_pipeline_rolling_back) {
+            if (result < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                voice_pipeline_rollback_failed = 1;
+            voice_pipeline_rolling_back = 0;
+            voice_transition.context = NULL;
             return voice_pipeline_restart_result;
         }
-        child=fork();
-        if(child==0){
-            if(voice_transition.context->config_path[0]&&setenv("LE_CONFIG_PATH",voice_transition.context->config_path,1))_exit(1);
-            _exit(voice_pipeline_restart(voice_transition.mode)==LE_OK?0:1);
+        if (result < 0 || !WIFEXITED(status)) {
+            voice_pipeline_restart_result = LE_IO;
+        } else if (WEXITSTATUS(status) == 0 &&
+                   !voice_pipeline_restart_timed_out) {
+            voice_pipeline_restart_result = LE_OK;
+        } else if (WEXITSTATUS(status) == 2) {
+            voice_pipeline_restart_result = LE_NOT_SUPPORTED;
+        } else {
+            voice_pipeline_restart_result = LE_IO;
         }
-        if(child<0){voice_pipeline_rollback_failed=1;voice_transition.context=NULL;}
-        else{voice_pipeline_restart_pid=child;voice_pipeline_rolling_back=1;}
-    }else voice_transition.context=NULL;
+        if (voice_transition.context && voice_pipeline_restart_result != LE_OK)
+            voice_pipeline_rollback_needed = 1;
+        else
+            voice_transition.context = NULL;
+    }
+    if (!voice_pipeline_rollback_needed || !allow_rollback)
+        return voice_pipeline_restart_result;
+    {
+        pid_t child;
+        long long deadline;
+
+        /* Forward transition failed: restore the saved snapshot and run it
+           again. The restore and persist happen here, never from a GET. */
+        voice_pipeline_rollback_needed = 0;
+        voice_transition_restore();
+        if (persist_configuration(voice_transition.context) != LE_OK) {
+            voice_pipeline_rollback_failed = 1;
+            voice_transition.context = NULL;
+            return voice_pipeline_restart_result;
+        }
+        child = fork();
+        if (child == 0) {
+            (void)setpgid(0, 0);
+            if (voice_transition.context->config_path[0] &&
+                setenv("LE_CONFIG_PATH", voice_transition.context->config_path, 1))
+                _exit(1);
+            _exit(voice_pipeline_restart(voice_transition.mode) == LE_OK ? 0 : 1);
+        }
+        if (child < 0) {
+            voice_pipeline_rollback_failed = 1;
+            voice_transition.context = NULL;
+        } else {
+            deadline = le_service_monotonic_ms() +
+                LE_VOICE_PIPELINE_RESTART_TIMEOUT_MS;
+            voice_pipeline_restart_pid = child;
+            voice_pipeline_rolling_back = 1;
+            voice_pipeline_restart_deadline_ms = deadline;
+            voice_pipeline_restart_escalate_ms = deadline +
+                LE_VOICE_PIPELINE_RESTART_ESCALATE_MS;
+        }
+    }
     return voice_pipeline_restart_result;
 }
 
 static int voice_pipeline_restart_pending(void)
 {
-    (void)voice_pipeline_restart_reap();
-    return voice_pipeline_restart_pid > 0;
+    (void)voice_pipeline_restart_advance(0);
+    return voice_pipeline_restart_pid > 0 || voice_pipeline_rollback_needed;
 }
 
 static const char *voice_pipeline_restart_state(void)
 {
-    int result = voice_pipeline_restart_reap();
-
-    if (voice_pipeline_restart_pid > 0 || result == LE_BUSY)
+    /* A read must not fork or persist. The server tick (api_tick) and the
+       request-path reap advance the job; this only reports what they left. */
+    if (voice_pipeline_restart_pid > 0 || voice_pipeline_rollback_needed)
         return "pending";
-    return result == LE_OK ? "ready" : "failed";
+    return voice_pipeline_restart_result == LE_OK ? "ready" : "failed";
+}
+
+static const char *voice_pipeline_restart_phase(void)
+{
+    if (voice_pipeline_rollback_needed || voice_pipeline_rolling_back)
+        return "rolling-back";
+    if (voice_pipeline_restart_pid > 0)
+        return "starting";
+    return "";
 }
 
 static const char *voice_pipeline_restart_error(void)
 {
-    if (voice_pipeline_restart_pid > 0 || voice_pipeline_restart_result == LE_OK)
+    if (voice_pipeline_restart_pid > 0 || voice_pipeline_rollback_needed ||
+        voice_pipeline_restart_result == LE_OK)
         return "";
-    if(voice_pipeline_rollback_failed)
+    if (voice_pipeline_rollback_failed)
         return "Voice pipeline transition failed; previous pipeline could not be restored";
+    if (voice_pipeline_restart_timed_out)
+        return "Voice pipeline transition timed out";
     return voice_pipeline_restart_result == LE_NOT_SUPPORTED
         ? "Home Assistant voice pipeline is not installed"
         : "Voice pipeline daemon restart failed";
@@ -591,19 +690,21 @@ static int voice_pipeline_restart(const char *mode)
 {
     int failed = 0, satellite_stop_failed = 0;
     const int ha = !strcmp(mode, "home-assistant");
+    long long deadline = le_service_monotonic_ms() +
+        LE_VOICE_PIPELINE_RESTART_TIMEOUT_MS;
 
-    if (access(LE_INIT_AGENTD,X_OK)==0 && run_init_command(LE_INIT_AGENTD, "stop"))
+    if (access(LE_INIT_AGENTD,X_OK)==0 && run_init_command_until(LE_INIT_AGENTD, "stop", deadline))
         failed = 1;
-    if (access(LE_INIT_STTD,X_OK)==0 && run_init_command(LE_INIT_STTD, "stop"))
+    if (access(LE_INIT_STTD,X_OK)==0 && run_init_command_until(LE_INIT_STTD, "stop", deadline))
         failed = 1;
     /* Restarted in every mode: its engine follows the saved mode (a Custom
        Wyoming client versus the local model), and in Home Assistant mode it
        still speaks reminders and the announce action. In that mode a ttsd
        that will not stop or start never blocks the satellite. */
-    if (access(LE_INIT_TTSD,X_OK)==0 && run_init_command(LE_INIT_TTSD, "stop") && !ha)
+    if (access(LE_INIT_TTSD,X_OK)==0 && run_init_command_until(LE_INIT_TTSD, "stop", deadline) && !ha)
         failed = 1;
     if (access(LE_INIT_ESPHOMED, X_OK) == 0 &&
-        run_init_command(LE_INIT_ESPHOMED, "stop"))
+        run_init_command_until(LE_INIT_ESPHOMED, "stop", deadline))
         failed = satellite_stop_failed = 1;
 
     if (ha) {
@@ -611,11 +712,11 @@ static int voice_pipeline_restart(const char *mode)
         if (access(LE_INIT_ESPHOMED, X_OK) < 0)
             return LE_NOT_SUPPORTED;
         if(failed)return LE_IO;
-        if (run_init_command(LE_INIT_ESPHOMED, "start"))
+        if (run_init_command_until(LE_INIT_ESPHOMED, "start", deadline))
             return LE_IO;
         /* Best effort: the tts feature may be absent or disabled by policy. */
         if (access(LE_INIT_TTSD, X_OK) == 0)
-            (void)run_init_command(LE_INIT_TTSD, "start");
+            (void)run_init_command_until(LE_INIT_TTSD, "start", deadline);
         for(tick=0;tick<50;tick++){
             if(esphome_satellite_ready()){
                 (void)refresh_home_assistant_discovery();return LE_OK;
@@ -626,11 +727,11 @@ static int voice_pipeline_restart(const char *mode)
     }
     /* Never activate the local owner while HA may still own the audio path. */
     if(satellite_stop_failed)return LE_IO;
-    if (run_init_command(LE_INIT_STTD, "start"))
+    if (run_init_command_until(LE_INIT_STTD, "start", deadline))
         failed = 1;
-    if (run_init_command(LE_INIT_TTSD, "start"))
+    if (run_init_command_until(LE_INIT_TTSD, "start", deadline))
         failed = 1;
-    if (run_init_command(LE_INIT_AGENTD, "start"))
+    if (run_init_command_until(LE_INIT_AGENTD, "start", deadline))
         failed = 1;
     (void)refresh_home_assistant_discovery();
     return failed ? LE_IO : LE_OK;
@@ -650,8 +751,8 @@ static int apply_voice_pipeline_mode(const char *mode)
     int result;
     pid_t child;
 
-    result = voice_pipeline_restart_reap();
-    if (voice_pipeline_restart_pid > 0)
+    result = voice_pipeline_restart_advance(0);
+    if (voice_pipeline_restart_pid > 0 || voice_pipeline_rollback_needed)
         return LE_BUSY;
     if (result != LE_OK) {
         voice_pipeline_restart_result = LE_OK;
@@ -669,6 +770,7 @@ static int apply_voice_pipeline_mode(const char *mode)
     if (child < 0)
         return LE_IO;
     if (child == 0) {
+        (void)setpgid(0, 0);
         if(voice_transition.context && voice_transition.context->config_path[0] &&
            setenv("LE_CONFIG_PATH",voice_transition.context->config_path,1))_exit(1);
         result = voice_pipeline_restart(mode);
@@ -677,6 +779,11 @@ static int apply_voice_pipeline_mode(const char *mode)
     }
     voice_pipeline_restart_pid = child;
     voice_pipeline_restart_result = LE_OK;
+    voice_pipeline_restart_timed_out = 0;
+    voice_pipeline_restart_deadline_ms = le_service_monotonic_ms() +
+        LE_VOICE_PIPELINE_RESTART_TIMEOUT_MS;
+    voice_pipeline_restart_escalate_ms = voice_pipeline_restart_deadline_ms +
+        LE_VOICE_PIPELINE_RESTART_ESCALATE_MS;
     return LE_BUSY;
 }
 static int pipeline_endpoint_reachable(const struct api_context *c,
@@ -941,8 +1048,10 @@ static void voice_pipeline_json(struct api_context *c,
     int tts_reachable;
     int satellite_ready;
     const char *restart_state;
+    const char *restart_phase;
 
     restart_state = voice_pipeline_restart_state();
+    restart_phase = voice_pipeline_restart_phase();
     ensure_voice_pipeline_config(c);
     custom = !strcmp(c->voice_pipeline_mode, "custom");
     home_assistant = !strcmp(c->voice_pipeline_mode, "home-assistant");
@@ -979,7 +1088,7 @@ static void voice_pipeline_json(struct api_context *c,
         "\"listening\":{\"max_utterance_ms\":%d,"
         "\"end_silence_ms\":%d,\"vad_floor_rms\":%d,"
         "\"noise_suppression\":%s},"
-        "\"restart\":{\"state\":\"%s\",\"error\":\"%s\"}},\"error\":null}",
+        "\"restart\":{\"state\":\"%s\",\"phase\":\"%s\",\"error\":\"%s\"}},\"error\":null}",
         c->voice_pipeline_mode, satellite_ready ? "true" : "false",
         home_assistant && esphome_satellite_connected() ? "true" : "false",
         custom ? "wyoming" : "sherpa",
@@ -990,7 +1099,7 @@ static void voice_pipeline_json(struct api_context *c,
         tts_reachable ? "true" : "false",
         c->stt_max_utterance_ms, c->stt_end_silence_ms,
         c->stt_vad_floor_rms, c->voice_noise_suppression ? "true" : "false",
-        restart_state, voice_pipeline_restart_error());
+        restart_state, restart_phase, voice_pipeline_restart_error());
 }
 static int voice_pipeline_update(struct api_context *c, const char *json)
 {
@@ -4099,8 +4208,9 @@ static void https_route(struct api_context*c,const struct api_request*q,struct a
     }
     https_private_ca(c,q,r);
 }
-void api_handle(struct api_context*c,const struct api_request*q,struct api_response*r){int rc;(void)voice_pipeline_restart_reap();if(!api_request_authorize(c,q,r))return;if(wake_model_route(c,q,r))return;if(!strcmp(q->path,"/api/v1/https/certificate")||!strcmp(q->path,"/api/v1/https/private-ca")){https_route(c,q,r);return;}if(!strcmp(q->path,"/api/v1/setup")){if(!strcmp(q->method,"GET")){setup_json(c,r);return;}if(!strcmp(q->method,"POST")){rc=setup_apply(c,q->body);if(rc){err(r,rc==LE_BUSY?409:rc==LE_INVALID?400:rc==LE_NOT_SUPPORTED?501:503,rc,rc==LE_BUSY?"Initial setup has already been completed":rc==LE_INVALID?"Setup details are invalid or incomplete":rc==LE_NOT_SUPPORTED?"A required hardware adapter is not available":setup_failure_message(c));return;}api_log(c,"info","Initial setup completed; access-point handoff requested");event_bus_publish(&c->events,"device_state","{\"setup_completed\":true}");ok(r,"{\"completed\":true,\"network_state\":\"connecting\",\"ap_mode_exit_required\":true,\"password_stored\":false}");return;}method_not_allowed(r);return;}if((!strcmp(q->path,"/api/v1")||!strcmp(q->path,"/api/v1/"))&&!strcmp(q->method,"GET")){ok(r,"{\"name\":\"LibreEcho API\",\"version\":\"v1\",\"status\":\"/api/v1/status\",\"playback\":\"/api/v1/playback\",\"setup\":\"/api/v1/setup\",\"openapi\":\"/openapi.json\",\"swagger\":\"/swagger.html\"}");return;}if(!strcmp(q->path,"/api/v1/config")&&!strcmp(q->method,"GET")){out(r,200,"{\"ok\":true,\"data\":{\"api_version\":1,\"os_version\":\"%s\",\"csrf_token\":\"%s\",\"authentication\":\"%s\",\"bootstrap_required\":%s,\"user_count\":%zu,\"bind_policy\":\"%s\",\"max_request_body\":16384,\"setup_completed\":%s,\"setup_url\":\"/setup.html\",\"ui_theme\":\"%s\",\"color_mode\":\"%s\"},\"error\":null}",LE_OS_VERSION_STRING,c->csrf_token,api_bootstrap_required_internal(c)?"bootstrap-required":c->auth.enabled?"users":c->auth_token[0]?"bearer-token":"development-disabled",api_bootstrap_required_internal(c)?"true":"false",c->auth.user_count,c->allow_insecure_lan?"lan-development":"loopback-default",c->setup_completed?"true":"false",c->ui_theme,c->color_mode);return;}api_handle_inner(c,q,r);}
+void api_handle(struct api_context*c,const struct api_request*q,struct api_response*r){int rc;(void)voice_pipeline_restart_advance(0);if(!api_request_authorize(c,q,r))return;if(wake_model_route(c,q,r))return;if(!strcmp(q->path,"/api/v1/https/certificate")||!strcmp(q->path,"/api/v1/https/private-ca")){https_route(c,q,r);return;}if(!strcmp(q->path,"/api/v1/setup")){if(!strcmp(q->method,"GET")){setup_json(c,r);return;}if(!strcmp(q->method,"POST")){rc=setup_apply(c,q->body);if(rc){err(r,rc==LE_BUSY?409:rc==LE_INVALID?400:rc==LE_NOT_SUPPORTED?501:503,rc,rc==LE_BUSY?"Initial setup has already been completed":rc==LE_INVALID?"Setup details are invalid or incomplete":rc==LE_NOT_SUPPORTED?"A required hardware adapter is not available":setup_failure_message(c));return;}api_log(c,"info","Initial setup completed; access-point handoff requested");event_bus_publish(&c->events,"device_state","{\"setup_completed\":true}");ok(r,"{\"completed\":true,\"network_state\":\"connecting\",\"ap_mode_exit_required\":true,\"password_stored\":false}");return;}method_not_allowed(r);return;}if((!strcmp(q->path,"/api/v1")||!strcmp(q->path,"/api/v1/"))&&!strcmp(q->method,"GET")){ok(r,"{\"name\":\"LibreEcho API\",\"version\":\"v1\",\"status\":\"/api/v1/status\",\"playback\":\"/api/v1/playback\",\"setup\":\"/api/v1/setup\",\"openapi\":\"/openapi.json\",\"swagger\":\"/swagger.html\"}");return;}if(!strcmp(q->path,"/api/v1/config")&&!strcmp(q->method,"GET")){out(r,200,"{\"ok\":true,\"data\":{\"api_version\":1,\"os_version\":\"%s\",\"csrf_token\":\"%s\",\"authentication\":\"%s\",\"bootstrap_required\":%s,\"user_count\":%zu,\"bind_policy\":\"%s\",\"max_request_body\":16384,\"setup_completed\":%s,\"setup_url\":\"/setup.html\",\"ui_theme\":\"%s\",\"color_mode\":\"%s\"},\"error\":null}",LE_OS_VERSION_STRING,c->csrf_token,api_bootstrap_required_internal(c)?"bootstrap-required":c->auth.enabled?"users":c->auth_token[0]?"bearer-token":"development-disabled",api_bootstrap_required_internal(c)?"true":"false",c->auth.user_count,c->allow_insecure_lan?"lan-development":"loopback-default",c->setup_completed?"true":"false",c->ui_theme,c->color_mode);return;}api_handle_inner(c,q,r);}
 
-int api_persist_configuration(struct api_context*c){(void)voice_pipeline_restart_reap();return persist_configuration(c);}
+void api_tick(struct api_context*c){(void)c;(void)voice_pipeline_restart_advance(1);}
+int api_persist_configuration(struct api_context*c){(void)voice_pipeline_restart_advance(0);return persist_configuration(c);}
 int api_diagnostics_kernel_authorize(struct api_context*c,const struct api_request*q,struct api_response*r){if(strcmp(q->method,"GET")){method_not_allowed(r);return 0;}if(!security(c,q,r))return 0;return 1;}
 int api_baby_monitor_stream_authorize(struct api_context*c,const struct api_request*q,struct api_response*r,int*card,int*device,int*channels,int*bits,int*channel){const char*prefix="/api/v1/baby-monitor/stream?source=";const char*value;char source[32],pcm[64],extra;size_t n;unsigned parsed_card,parsed_device,parsed_channel=0;if(!c||!q||!r||!card||!device||!channels||!bits||!channel)return 0;if(!security(c,q,r))return 0;if(strcmp(q->method,"GET")){method_not_allowed(r);return 0;}if(strncmp(q->path,prefix,strlen(prefix))){err(r,404,LE_INVALID,"Baby-monitor stream was not found");return 0;}value=q->path+strlen(prefix);n=strcspn(value,"&");if(n==0||query_component_decode(source,sizeof(source),value,n)){err(r,400,LE_INVALID,"A valid microphone source is required");return 0;}if(sscanf(source,"%u:%u%c",&parsed_card,&parsed_device,&extra)!=2||parsed_card>31||parsed_device>31){err(r,400,LE_INVALID,"A valid microphone source is required");return 0;}if(n&&value[n]){const char*ch=strstr(value+n,"&channel=");if(ch&&sscanf(ch+9,"%u%c",&parsed_channel,&extra)!=1){err(r,400,LE_INVALID,"A valid microphone channel is required");return 0;}}if(!strcmp(le_backend_mode(c->backend),"mock")){err(r,501,LE_NOT_SUPPORTED,"Microphone streaming is unavailable in the mock backend");return 0;}if(parsed_card!=0||parsed_device!=24||parsed_channel>6){err(r,400,LE_INVALID,"The selected Echo microphone channel is invalid");return 0;}snprintf(pcm,sizeof(pcm),"/dev/snd/pcmC%uD%uc",parsed_card,parsed_device);if(access(pcm,R_OK)){err(r,503,LE_NOT_SUPPORTED,"Selected microphone source is unavailable");return 0;}*card=(int)parsed_card;*device=(int)parsed_device;*channels=9;*bits=24;*channel=(int)parsed_channel;return 1;}

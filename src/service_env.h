@@ -19,9 +19,36 @@ void le_service_env_isolate(void);
  * Run `path` with `argv` (argv[0] is the process name, the array is
  * NULL-terminated) under that boundary, and wait for it. Returns 0 when the
  * child exited 0, and -1 when it could not be started, could not be waited
- * for, or exited non-zero.
+ * for, or exited non-zero. There is no bound: the caller decides how long a
+ * service operation may take. Use le_service_command_timeout where a value has
+ * to be bounded.
  */
 int le_service_command(const char *path, const char *const *argv);
+
+/*
+ * The same command with an overall deadline. The child leads its own process
+ * group, and when the deadline passes the group is SIGTERMed, then SIGKILLed,
+ * and reaped before this returns, so the work the init script started cannot
+ * outlive the call. Returns -1 for a command that timed out.
+ */
+int le_service_command_timeout(const char *path, const char *const *argv,
+                               unsigned int timeout_ms);
+
+/*
+ * A monotonic millisecond clock shared with callers that track their own
+ * deadlines, so a timeout is not measured with a second, differently-drifted
+ * clock. Returns 0 when the clock is unavailable.
+ */
+long long le_service_monotonic_ms(void);
+
+/*
+ * Terminate the process group led by `pgid` the way a cancelled command is
+ * terminated: SIGTERM, a grace period for the group to have no runnable member,
+ * then SIGKILL what is left. The leader is not reaped here because the caller
+ * owns that waitpid; a leader that has finished reads as dead already (see
+ * le_service_group_is_live).
+ */
+void le_service_group_terminate(pid_t pgid);
 
 /*
  * The same command, for a caller that can be asked to stop while the child is

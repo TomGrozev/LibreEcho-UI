@@ -69,6 +69,43 @@ int main(void)
     assert(!strcmp(voice_pipeline_restart_state(), "failed"));
     assert(apply_voice_pipeline_mode("local") == LE_IO);
 
+    /*
+     * A failed forward transition is reported, but only the tick starts its
+     * rollback: a request-path advance must leave the rollback undone and
+     * still expose the phase.
+     */
+    {
+        struct api_context c;
+        struct timespec delay = {0, 50000000L};
+        unsigned int attempts;
+
+        memset(&c, 0, sizeof(c));
+        snprintf(c.config_path, sizeof(c.config_path),
+                 "/tmp/libreecho-restart-phase-config.json");
+        snprintf(c.voice_pipeline_mode, sizeof(c.voice_pipeline_mode),
+                 "local");
+        unlink(c.config_path);
+        write_init_script(LE_INIT_AGENTD, 1);
+        voice_transition_capture(&c);
+        voice_pipeline_restart_result = LE_OK;
+        assert(apply_voice_pipeline_mode("local") == LE_BUSY);
+        for (attempts = 0; attempts < 240; ++attempts) {
+            (void)voice_pipeline_restart_advance(0);
+            if (voice_pipeline_restart_pid <= 0)
+                break;
+            nanosleep(&delay, NULL);
+        }
+        assert(voice_pipeline_restart_pid <= 0);
+        assert(voice_pipeline_rollback_needed);
+        assert(!strcmp(voice_pipeline_restart_state(), "pending"));
+        assert(!strcmp(voice_pipeline_restart_phase(), "rolling-back"));
+        (void)voice_pipeline_restart_advance(1);   /* the tick starts it */
+        wait_for_restart();
+        assert(!strcmp(voice_pipeline_restart_state(), "failed"));
+        voice_pipeline_restart_result = LE_OK;
+        unlink(c.config_path);
+    }
+
     /* Home Assistant is rejected before any local daemon is stopped. */
     unlink(LE_INIT_ESPHOMED);
     assert(apply_voice_pipeline_mode("home-assistant") == LE_NOT_SUPPORTED);

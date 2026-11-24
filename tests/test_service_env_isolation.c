@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define WEB_ARGS "--backend linux --config /data/libreecho/config/web-config.json --web-root /usr/local/share/libreecho/web --listen 0.0.0.0:8080 --allow-insecure-lan"
@@ -31,6 +32,8 @@
 #define WEB_PIDFILE "/var/run/libreecho-web.pid"
 #define WEB_LOGFILE "/var/log/libreecho-web.log"
 #define SCRIPT "/tmp/libreecho-249-boundary.sh"
+#define WEDGED "/tmp/libreecho-249-wedged.sh"
+#define WEDGED_CHILD "/tmp/libreecho-249-wedged-child.pid"
 #define RECORD "/tmp/libreecho-249-boundary.txt"
 #define MISSING "/tmp/libreecho-249-does-not-exist"
 
@@ -67,6 +70,55 @@ static void write_script(void)
         printf("  FAIL  fixture script could not be written\n");
         exit(1);
     }
+}
+
+static void write_wedged_script(void)
+{
+    /* The shell waits on a descendant that ignores SIGTERM, so the deadline
+       has to reach the whole group and use SIGKILL, not only kill the shell. */
+    static const char body[] =
+        "#!/bin/sh\n"
+        "sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' &\n"
+        "echo $! > " WEDGED_CHILD "\n"
+        "wait\n";
+    FILE *file = fopen(WEDGED, "w");
+
+    if (!file || fputs(body, file) == EOF || fclose(file) != 0 ||
+        chmod(WEDGED, 0700) != 0) {
+        printf("  FAIL  wedged fixture script could not be written\n");
+        exit(1);
+    }
+}
+
+static long long elapsed_ms(const struct timespec *start)
+{
+    struct timespec end;
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    return (long long)(end.tv_sec - start->tv_sec) * 1000 +
+           (end.tv_nsec - start->tv_nsec) / 1000000;
+}
+
+/* A zombie has finished and only waits to be reaped; it is not work. */
+static int still_running(pid_t pid)
+{
+    char path[64], line[256];
+    char *state;
+    FILE *file;
+
+    snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+    file = fopen(path, "r");
+    if (!file)
+        return 0;
+    if (!fgets(line, sizeof(line), file)) {
+        fclose(file);
+        return 0;
+    }
+    fclose(file);
+    state = strrchr(line, ')');
+    if (!state || state[1] != ' ')
+        return 0;
+    return state[2] != 'Z' && state[2] != 'X';
 }
 
 static void load_record(void)
@@ -116,6 +168,7 @@ int main(void)
     const char *shell_action[4] = {"sh", SCRIPT, "recover", NULL};
 
     write_script();
+    write_wedged_script();
     setenv("LIBREECHO_TEST_RECORD", RECORD, 1);
     /* Exactly what the Web daemon carries while it controls other services. */
     setenv("ARGS", WEB_ARGS, 1);
@@ -160,6 +213,32 @@ int main(void)
     check(le_service_command(SCRIPT, script_action) != 0,
           "a failing script is reported as a failure");
     unsetenv("LIBREECHO_TEST_EXIT");
+    printf("boundary: a wedged script is terminated at the deadline\n");
+    {
+        const char *wedged_action[2] = {WEDGED, NULL};
+        struct timespec start;
+        long long took;
+        long parsed = 0;
+        pid_t child = 0;
+        FILE *file;
+
+        unlink(WEDGED_CHILD);
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        check(le_service_command_timeout(WEDGED, wedged_action, 300) != 0,
+              "a wedged script is reported as a failure");
+        took = elapsed_ms(&start);
+        check(took < 5000, "the wait is bounded by the deadline");
+        file = fopen(WEDGED_CHILD, "r");
+        if (file) {
+            if (fscanf(file, "%ld", &parsed) == 1)
+                child = (pid_t)parsed;
+            fclose(file);
+        }
+        check(child > 1, "the wedged script started its descendant");
+        check(child <= 1 || !still_running(child),
+              "the deadline reaches the script's process group");
+        unlink(WEDGED_CHILD);
+    }
     check(le_service_command(MISSING, script_action) != 0,
           "a script that cannot be executed is reported as a failure");
 

@@ -474,6 +474,9 @@ le_backend_tick(api->backend);
 api_provision_poll(api);
 /* Keeps this control centre's _libreecho._tcp record in step (#413). */
 api_discovery_tick(api);
+/* Reaps the tracked voice-pipeline restart and starts its rollback after a
+   failed forward transition, so no request path has to. */
+api_tick(api);
 }le_feature_provenance_tick();
 le_authority_provenance_tick();
 }for(i=0;
