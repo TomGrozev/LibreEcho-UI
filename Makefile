@@ -1228,6 +1228,20 @@ $(BUILD)/test-voice-whisper: tests/test_voice_whisper.c \
 		-Wpedantic -Werror -Isrc tests/test_voice_whisper.c \
 		src/adapter/voice_whisper.c -o $@
 
+$(BUILD)/test-config-import-linux: tests/test_config_import_linux.c \
+	src/api.c src/backend.c src/backend_mock.c src/backend_linux.c src/event_bus.c \
+	src/auth.c src/log.c src/json.c src/config_store.c src/factory_reset.c \
+	src/adapter/adapter_client.c src/adapter/wyoming_client.c src/service_env.c \
+	src/adapter/timer_schedule.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) -D_POSIX_C_SOURCE=200809L -std=c99 -O2 -Wall -Wextra \
+		-Wpedantic -ffunction-sections -fdata-sections -Wl,--gc-sections \
+		-Isrc -Isrc/adapter $< src/backend.c src/backend_mock.c src/backend_linux.c \
+		src/event_bus.c src/auth.c src/log.c src/json.c src/config_store.c \
+		src/factory_reset.c src/adapter/adapter_client.c \
+		src/adapter/wyoming_client.c src/service_env.c \
+		src/adapter/timer_schedule.c -o $@
+
 $(BUILD)/test-voice-pipeline-restart: tests/test_voice_pipeline_restart.c \
 	src/api.c src/wake_model.c src/wake_model_store.c src/backend.c src/json.c src/config_store.c src/adapter/wyoming_client.c src/service_env.c src/adapter/timer_schedule.c src/adapter/voice_clip_store.c
 	@mkdir -p $(BUILD)
@@ -1528,6 +1542,7 @@ clean:
 		$(BUILD)/test-voice-listening-feedback \
 		$(BUILD)/test-voice-pipeline-restart \
 		$(BUILD)/test-voice-whisper \
+		$(BUILD)/test-config-import-linux \
 		$(BUILD)/test-service-env-isolation \
 		$(BUILD)/test-service-cancel-linux \
 		$(BUILD)/test-voice-pipeline-env-isolation \
