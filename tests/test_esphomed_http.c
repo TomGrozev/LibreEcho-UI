@@ -20,6 +20,26 @@ static int frame_pieces(const char *s,size_t step){size_t n=strlen(s);esp_playba
 /* Whole and byte-at-a-time framing must agree on verdict and payload. */
 static int check_chunks(const char *s){unsigned char whole_payload[64];int whole=frame_pieces(s,strlen(s)?strlen(s):1);size_t n=p.pay_n;assert(n<=sizeof whole_payload);memcpy(whole_payload,p.payload,n);esp_playback_close(&p);
  int bytewise=frame_pieces(s,1);assert(whole==bytewise);if(!whole)assert(p.pay_n==n&&!memcmp(p.payload,whole_payload,n));return whole;}
+/* The split forms the announcement failure was traced to: a read ending
+ * inside a chunk-size line (after 1 to 3 digits, and between CR and LF) or
+ * inside the final 0\r\n\r\n must not lose what was already parsed. */
+static void split_boundaries(void){
+ static const char *cases[]={
+  "1\r\nx\r\n2\r\nyz\r\n0\r\n\r\n",
+  "10\r\n0123456789abcdef\r\n0\r\n\r\n",
+  "3\r\nabc\r\n0\r\n\r\n",
+  "3\r\nabc\r\n0\r\nX: 1\r\n\r\n"};
+ for(unsigned i=0;i<sizeof cases/sizeof *cases;i++){
+  assert(check_chunks(cases[i])==0);
+  size_t len=strlen(cases[i]);
+  /* Every single cut point, so the CRLF and the terminator each straddle one. */
+  for(size_t cut=1;cut<len;cut++){esp_playback_init(&p);p.chunked=1;p.expected=SIZE_MAX;
+   memcpy(p.wire,cases[i],cut);p.wire_n=cut;assert(unframe(&p)>=0);
+   size_t kept=p.wire_n;memcpy(p.wire+kept,cases[i]+cut,len-cut);p.wire_n=kept+len-cut;assert(unframe(&p)>=0);
+   assert(p.chunk_stage==CHUNK_DONE);esp_playback_close(&p);}
+ }
+ puts("Chunk-size lines, CRLF and the final terminator split at every boundary: OK");
+}
 /* The server side: one response, released to the client a prefix at a time. */
 static unsigned char resp[4U*1024U*1024U];static size_t resp_n,resp_sent,resp_allow;static int peer=-1,want_shut,shut_done;
 static void resp_reset(void){resp_n=resp_sent=resp_allow=0;want_shut=shut_done=0;}
@@ -160,6 +180,15 @@ static void stall_reconnect(void){static unsigned char b[44+48000*4],other[44+48
  int idle=take_request(server);for(unsigned i=0;i<500;i++)assert(tick()==0);assert(p.reconnects==0);close(idle);close(server);esp_playback_close(&p);
  puts("Stalled reply resumes on a new connection, skipping exactly what played; a differing or short replay fails: OK");
 }
+/* A framing failure is a hard tick error, but it must leave the slot closed so
+ * the next announcement starts clean: esphomed's turn_clear does the same. */
+static void recover_after_failure(void){unsigned char b[44+48000*2];size_t n=tone(b,48000,900,1);
+ bus_reset();resp_reset();resp_text("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");resp_chunked(b,n,4096);allow_all(1);fetch(bus);
+ assert(run(4000)==-1);assert(p.result==-1&&p.state==0&&p.fd==-1);end_fetch();
+ bus_reset();resp_reset();resp_text("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");resp_chunked(b,n,4096);resp_text("0\r\n\r\n");allow_all(1);fetch(bus);
+ assert(run(4000)==1&&p.audio_frames==48000&&bus_size()==p.audio_frames*4);end_fetch();
+ puts("A failed reply closes its slot and the next reply plays: OK");
+}
 /* Before blocking TLS work a FIFO gets a bounded pre-roll of silence, topped up only to its lead. */
 static void preroll_fifo(void){bus_fifo();esp_playback_init(&p);int z=snprintf(p.bus,sizeof p.bus,"%.250s",fifo);assert(z>0&&(size_t)z==strlen(fifo));assert(!bus_open(&p)&&p.fifo);
  preroll(&p,now_ms);int queued=0,again=0;assert(!ioctl(reader,FIONREAD,&queued)&&queued>=48000*4*240/1000&&queued<=PREROLL_QUEUE+(int)SILENCE_FRAMES*4&&p.frames*1000/48000>=240);
@@ -187,10 +216,11 @@ int main(int argc,char **argv){
  assert(check_chunks("3\r\nabc\r\n2\r\nde\r\n0\r\nX-Test: yes\r\n\r\n")==0);assert(p.pay_n==5);assert(!memcmp(p.payload,"abcde",5));esp_playback_close(&p);
  static const char *bad[]={"", "0\r\n", "3\r\nab\r\n0\r\n\r\n", "z\r\nabc\r\n0\r\n\r\n", "FFFFFFFFFFFFFFFF\r\n", "1\r\naXX0\r\n\r\n", "0\r\n\r\nextra", "0\r\nInvalid trailer\r\n\r\n", "3;ext=1\r\nabc\r\n0\r\n\r\n", "\r\n"};
  for(unsigned i=0;i<sizeof bad/sizeof *bad;i++)assert(check_chunks(bad[i])==-1);
+ split_boundaries();
  puts("HTTP header ceiling and bounded chunked decoding, whole and byte by byte: OK");
  /* Run the untouched external capture first so RED identifies the real bug. */
  if(argc==2)ffmpeg_wav(argv[1]);else assert(argc==1);
  wav_boundaries();unsigned char b[52];wav_header(b,sizeof b);put32(b+4,UINT32_MAX);put32(b+40,UINT32_MAX);http_boundaries(b,sizeof b);
- streams_before_eof();long_and_slow();warm_fifo();warm_before_reply();preroll_fifo();stall_reconnect();
+ streams_before_eof();long_and_slow();warm_fifo();warm_before_reply();preroll_fifo();stall_reconnect();recover_after_failure();
  assert(unlink(bus)==0);return 0;
 }

@@ -36,6 +36,17 @@ if [ -n "${ESPHOMED_TEST_TLS_PREFIX:-}" ]; then
 else
     echo "SKIP test-tls-self-signed: set ESPHOMED_TEST_TLS_PREFIX to a staged mbedTLS 3.6.7 prefix"
 fi
+# Streaming reply framing is host-only work, but esphome_playback.h needs
+# mbedTLS headers, so it runs on the same staged prefix and skips otherwise.
+if [ -n "${ESPHOMED_TEST_TLS_PREFIX:-}" ]; then
+    TP=$ESPHOMED_TEST_TLS_PREFIX
+    cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Werror -Wno-misleading-indentation -Isrc -I"$TP/include" \
+        tests/test_esphomed_http.c src/adapter/radio_resample.c \
+        "$TP/lib/libmbedtls.a" "$TP/lib/libmbedx509.a" "$TP/lib/libmbedcrypto.a" -lm -o build/test-esphomed-http
+    ./build/test-esphomed-http
+else
+    echo "SKIP test-esphomed-http: set ESPHOMED_TEST_TLS_PREFIX to a staged mbedTLS 3.6.7 prefix"
+fi
 make build/test-update-identity
 ./build/test-update-identity
 python3 tests/test_github_link_contract.py
