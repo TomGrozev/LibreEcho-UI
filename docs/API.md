@@ -2453,6 +2453,18 @@ its own light/dark choice; the header ☼ button saves one.
 
 **Response:** `{"ui_theme":"setup","color_mode":"dark"}`.
 
+#### GET /api/v1/radio
+#### PUT /api/v1/radio
+
+Read or set the EFR32 802.15.4 personality: `thread`, `zigbee`, or `none`.
+This endpoint exists only on Lidar and answers `404` on every other target.
+A PUT takes `{"radio":"thread"|"zigbee"|"none"}`; any other value is `400` and
+nothing changes. The value is saved in `web-config.json` and carried by
+configuration export/import; the thread service applies it at its next start,
+not on the PUT itself.
+
+**Response:** `{"radio":"thread"}`.
+
 #### GET /api/v1/config/export
 
 Export the confirmed-safe configuration as JSON. The export remains useful on

@@ -300,6 +300,8 @@ make build/test-voice-pipeline-restart
 ./build/test-voice-pipeline-restart
 make build/test-config-import-linux
 ./build/test-config-import-linux
+make build/test-config-import-radio
+./build/test-config-import-radio
 make build/test-home-assistant-discovery
 ./build/test-home-assistant-discovery
 sh tests/test_wake_led.sh

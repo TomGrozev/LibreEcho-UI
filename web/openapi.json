@@ -3846,6 +3846,43 @@
     }
    }
   },
+  "/radio": {
+   "get": {
+    "tags": ["Device"],
+    "summary": "Read the 802.15.4 radio setting",
+    "description": "Lidar only; every other target answers 404. Reports whether the EFR32 runs Thread, Zigbee, or neither. The value is saved in web-config.json and read by the thread service when it starts.",
+    "responses": {
+     "200": {"$ref": "#/components/responses/Success"},
+     "404": {"$ref": "#/components/responses/Error"}
+    }
+   },
+   "put": {
+    "tags": ["Device"],
+    "summary": "Set the 802.15.4 radio setting",
+    "description": "Lidar only; every other target answers 404. Body: {\"radio\":\"thread\"|\"zigbee\"|\"none\"}; any other value is 400 and nothing changes. The value is persisted only; it applies when the thread service next starts.",
+    "parameters": [{"$ref": "#/components/parameters/Csrf"}],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": ["radio"],
+        "properties": {
+         "radio": {"type": "string", "enum": ["thread", "zigbee", "none"]}
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {"$ref": "#/components/responses/Success"},
+     "400": {"$ref": "#/components/responses/Error"},
+     "404": {"$ref": "#/components/responses/Error"},
+     "501": {"$ref": "#/components/responses/Error"}
+    }
+   }
+  },
   "/voice/clips": {
    "get": {
     "tags": ["Privacy"],

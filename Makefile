@@ -1226,6 +1226,14 @@ $(BUILD)/test-config-import-linux: tests/test_config_import_linux.c \
 		src/factory_reset.c src/adapter/adapter_client.c \
 		src/adapter/wyoming_client.c src/service_env.c \
 		src/adapter/timer_schedule.c -o $@
+$(BUILD)/test-config-import-radio: tests/test_config_import_radio.c \
+	$(filter-out $(BUILD)/api.o $(BUILD)/main.o $(BUILD)/http_server.o,$(OBJECTS))
+	@mkdir -p $(BUILD)
+	$(CC) $(CPPFLAGS) -D_POSIX_C_SOURCE=200809L -std=c99 -O2 -Wall -Wextra \
+		-Wpedantic -ffunction-sections -fdata-sections -Wl,--gc-sections \
+		-Isrc -Isrc/adapter $< \
+		$(filter-out $(BUILD)/api.o $(BUILD)/main.o $(BUILD)/http_server.o,$(OBJECTS)) \
+		$(LDFLAGS) $(WEB_TLS_LIBS) -lm -lpthread -o $@
 
 $(BUILD)/test-voice-pipeline-restart: tests/test_voice_pipeline_restart.c \
 	src/api.c src/wake_model.c src/wake_model_store.c src/backend.c src/json.c src/config_store.c src/adapter/wyoming_client.c src/service_env.c src/adapter/timer_schedule.c src/adapter/voice_clip_store.c
@@ -1551,6 +1559,7 @@ clean:
 		$(BUILD)/test-voice-pipeline-restart \
 		$(BUILD)/test-voice-whisper \
 		$(BUILD)/test-config-import-linux \
+		$(BUILD)/test-config-import-radio \
 		$(BUILD)/test-service-env-isolation \
 		$(BUILD)/test-service-cancel-linux \
 		$(BUILD)/test-voice-pipeline-env-isolation \
