@@ -161,6 +161,7 @@ make build/test-wake-led-profile
 ./build/test-wake-led-profile
 sh tests/test_voice_listening_led_profile.sh
 sh tests/test_startup_animation.sh
+python3 tests/test_web_startup_readiness.py
 ./build/test-watchdog-policy
 make build/libreecho-watchdogd
 sh tests/test_watchdogd_recovery.sh

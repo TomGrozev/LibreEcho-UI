@@ -27,7 +27,9 @@ ARGS=${ARGS:---backend linux --config $CONFIG_FILE --web-root /usr/local/share/l
 USERS_FILE=${USERS_FILE:-/data/libreecho/config/users}
 ARGS="$ARGS --users-file $USERS_FILE"
 STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}
-STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}
+STARTUP_READY_MAX_DELAY=${STARTUP_READY_MAX_DELAY:-5}
+VAR_RUN=${VAR_RUN:-/var/run}
+SOCKET_DIR=${SOCKET_DIR:-/run/libreecho}
 BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}
 FEATURE_POLICY_FILE=${FEATURE_POLICY_FILE:-/etc/libreecho/feature-policy}
 ESPHOMED_PIDFILE=${LIBREECHO_ESPHOMED_PIDFILE:-/var/run/libreecho-esphomed.pid}
@@ -77,7 +79,11 @@ terminate() {
     kill -KILL "$target" 2>/dev/null || true
 }
 
-airplay_integration_state() {
+# Prints enabled when the given bit is set in the configuration's integrations
+# mask, disabled otherwise.  A missing or malformed mask reads as disabled,
+# matching the reconciler's select_topology, which treats it as no integration.
+integration_state() {
+    bit=$1
     integrations=
     if [ -r "$CONFIG_FILE" ]; then
         integrations=$(sed -n \
@@ -85,9 +91,9 @@ airplay_integration_state() {
             "$CONFIG_FILE" 2>/dev/null | sed -n '1p' | tr -d '[:space:]')
     fi
     case "$integrations" in
-        ''|*[!0-9]*) printf '%s\n' enabled ;;
+        ''|*[!0-9]*) printf '%s\n' disabled ;;
         *)
-            if [ $((integrations & 16)) -ne 0 ]; then
+            if [ $((integrations & bit)) -ne 0 ]; then
                 printf '%s\n' enabled
             else
                 printf '%s\n' disabled
@@ -137,63 +143,61 @@ bluetooth_ready() {
     esac
 }
 
+service_alive() {
+    pidfile="$VAR_RUN/libreecho-$1.pid"
+    [ -s "$pidfile" ] || return 1
+    pid=$(sed -n '1p' "$pidfile")
+    case "$pid" in *[!0-9]*|'') return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null
+}
+
 startup_services_ready() {
     service=
     for service in networkd timed audiod micd ledd web; do
-        pidfile="/var/run/libreecho-$service.pid"
+        pidfile="$VAR_RUN/libreecho-$service.pid"
         [ -s "$pidfile" ] || return 1
         pid=$(sed -n '1p' "$pidfile")
         case "$pid" in *[!0-9]*|'') return 1 ;; esac
         kill -0 "$pid" 2>/dev/null || return 1
     done
     for socket in network audio mic led; do
-        [ -S "/run/libreecho/$socket.sock" ] || return 1
+        [ -S "$SOCKET_DIR/$socket.sock" ] || return 1
     done
-    case "$(airplay_integration_state)" in
+    case "$(integration_state 16)" in
         disabled) ;;
         enabled)
-            pidfile=/var/run/libreecho-airplayd.pid
-            [ -s "$pidfile" ] || return 1
-            pid=$(sed -n '1p' "$pidfile")
-            case "$pid" in *[!0-9]*|'') return 1 ;; esac
-            kill -0 "$pid" 2>/dev/null || return 1
-            [ -S /run/libreecho/airplay.sock ] || return 1
+            service_alive airplayd || return 1
+            [ -S "$SOCKET_DIR/airplay.sock" ] || return 1
             ;;
         *) return 1 ;;
     esac
     if [ "$(feature_policy)" = community-noncommercial ]; then
-        pidfile=/var/run/libreecho-waked.pid
-        [ -s "$pidfile" ] || return 1
-        pid=$(sed -n '1p' "$pidfile")
-        case "$pid" in *[!0-9]*|'') return 1 ;; esac
-        kill -0 "$pid" 2>/dev/null || return 1
-        [ -S /run/libreecho/wakeword.sock ] || return 1
+        service_alive waked || return 1
+        [ -S "$SOCKET_DIR/wakeword.sock" ] || return 1
     fi
     case "$(bluetooth_integration_state)" in
         disabled) ;;
         enabled)
-            [ -s /var/run/libreecho-btd.pid ] || return 1
-            pid=$(sed -n '1p' /var/run/libreecho-btd.pid)
-            case "$pid" in *[!0-9]*|'') return 1 ;; esac
-            kill -0 "$pid" 2>/dev/null || return 1
-            [ -S /run/libreecho/bluetooth.sock ] || return 1
+            service_alive btd || return 1
+            [ -S "$SOCKET_DIR/bluetooth.sock" ] || return 1
             bluetooth_ready || return 1
             ;;
         *) return 1 ;;
     esac
-    if [ -S /run/libreecho/stt.sock ] &&
-       [ -S /run/libreecho/tts.sock ] &&
-       [ -S /run/libreecho/agent.sock ]; then
+    # select_topology mounts either the local assistant (sttd, ttsd and
+    # agentd) or the ESPHome satellite, chosen by the Home Assistant
+    # integration bit.  Wait for the graph the configured topology runs; the
+    # other one is stopped by the reconciler and must not hold the gate.
+    if [ "$(integration_state 1)" = enabled ]; then
+        esphome_service_ready
+    else
         for service in sttd ttsd agentd; do
-            pidfile="/var/run/libreecho-$service.pid"
-            [ -s "$pidfile" ] || return 1
-            pid=$(sed -n '1p' "$pidfile")
-            case "$pid" in *[!0-9]*|'') return 1 ;; esac
-            kill -0 "$pid" 2>/dev/null || return 1
+            service_alive "$service" || return 1
         done
-        return 0
+        for socket in stt tts agent; do
+            [ -S "$SOCKET_DIR/$socket.sock" ] || return 1
+        done
     fi
-    esphome_service_ready
 }
 
 esphome_service_ready() {
@@ -204,7 +208,7 @@ esphome_service_ready() {
 }
 
 mark_startup_ready() {
-    count=0
+    delay=1
     while :; do
         if startup_services_ready; then
             tmp="$STARTUP_READY.tmp"
@@ -212,9 +216,12 @@ mark_startup_ready() {
             mv -f "$tmp" "$STARTUP_READY"
             return 0
         fi
-        sleep 0.1
-        count=$((count + 1))
-        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0
+        # Each probe forks several helpers.  Ten probes a second forever cost
+        # more than the UI this gate protects, so back off to a fixed ceiling
+        # while waiting for services that may never be mounted.
+        sleep "$delay"
+        delay=$((delay * 2))
+        [ "$delay" -le "$STARTUP_READY_MAX_DELAY" ] || delay=$STARTUP_READY_MAX_DELAY
     done
 }
 

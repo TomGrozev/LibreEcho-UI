@@ -37,8 +37,8 @@ assert 'kill -0' in init
 # The startup gate must allow time for WMT/CONSYS activation while btd retries,
 # but a deliberately disabled Bluetooth integration must not hold the whole UI
 # in its startup animation.
-assert 'STARTUP_READY_TIMEOUT_TICKS' in web
-assert 'STARTUP_READY_TIMEOUT_TICKS:-600' in web
+assert 'STARTUP_READY_MAX_DELAY' in web
+assert 'STARTUP_READY_MAX_DELAY:-5' in web
 assert 'bluetooth_integration_state()' in web
 assert 'bluetooth_ready()' in web
 assert 'BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}' in web
