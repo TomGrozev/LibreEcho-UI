@@ -44,7 +44,7 @@
 #define MP3_WINDOW 4612U      /* two largest free-format frames and the next header: minimp3 syncs on whole frames */
 enum{FORMAT_NONE,FORMAT_WAV,FORMAT_MP3};
 enum{WAV_RIFF,WAV_CHUNK,WAV_DATA,WAV_TRAIL};
-enum{CHUNK_SIZE,CHUNK_SIZE_LF,CHUNK_DATA,CHUNK_DATA_CR,CHUNK_DATA_LF,CHUNK_TRAILER,CHUNK_DONE};
+enum{CHUNK_SIZE,CHUNK_SIZE_EXT,CHUNK_SIZE_LF,CHUNK_DATA,CHUNK_DATA_CR,CHUNK_DATA_LF,CHUNK_TRAILER,CHUNK_DONE};
 static unsigned u16(const unsigned char *p){return p[0]|((unsigned)p[1]<<8);}
 static uint32_t u32(const unsigned char *p){return u16(p)|((uint32_t)u16(p+2)<<16);}
 static unsigned be16(const unsigned char *p){return ((unsigned)p[0]<<8)|p[1];}
@@ -108,8 +108,13 @@ static int unframe(struct esp_playback *p){
   p->wire_pos++;
   switch(p->chunk_stage){
   case CHUNK_SIZE:if(c=='\r'){if(!p->chunk_digits)return -1;p->chunk_stage=CHUNK_SIZE_LF;break;}
+   /* RFC 9112: ignore chunk extensions the peer sends. HA adds none today,
+    * but a proxy in front of it may, and rejecting them broke the reply. */
+   if(c==';'){if(!p->chunk_digits)return -1;p->chunk_ext=0;p->chunk_stage=CHUNK_SIZE_EXT;break;}
    if(c>='0'&&c<='9')v=c-'0';else if(c>='a'&&c<='f')v=c-'a'+10;else if(c>='A'&&c<='F')v=c-'A'+10;else return -1;
    if(p->chunk_left>(ESP_PLAY_BODY_MAX-v)/16||++p->chunk_digits>16)return -1;p->chunk_left=p->chunk_left*16+v;break;
+  case CHUNK_SIZE_EXT:if(c=='\r'){p->chunk_stage=CHUNK_SIZE_LF;break;}
+   if(!c||c=='\n'||++p->chunk_ext>1024)return -1;break;
   case CHUNK_SIZE_LF:if(c!='\n'||p->chunk_left>ESP_PLAY_BODY_MAX-p->body_total)return -1;p->chunk_digits=0;p->chunk_stage=p->chunk_left?CHUNK_DATA:CHUNK_TRAILER;break;
   case CHUNK_DATA_CR:if(c!='\r')return -1;p->chunk_stage=CHUNK_DATA_LF;break;
   case CHUNK_DATA_LF:if(c!='\n')return -1;p->chunk_stage=CHUNK_SIZE;break;

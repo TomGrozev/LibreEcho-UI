@@ -26,7 +26,7 @@ struct esp_playback {
  unsigned char wire[ESP_PLAY_WIRE];size_t wire_n,wire_pos,expected,body_total;
  unsigned char payload[ESP_PLAY_PAYLOAD];size_t pay_n,pay_pos;
  /* Chunked transfer framing, decoded a byte at a time. */
- int chunk_stage,trailer_cr,trailer_colon;unsigned chunk_digits;uint64_t chunk_left;size_t trailer_bytes,trailer_line;
+ int chunk_stage,trailer_cr,trailer_colon;unsigned chunk_digits,chunk_ext;uint64_t chunk_left;size_t trailer_bytes,trailer_line;
  /* WAV chunk walk and MP3 resynchronisation. */
  int wav_stage,data_unbounded;uint32_t riff;uint64_t wav_bytes,skip,data_left,mp3_skipped;
  unsigned char dns_query[300];size_t dns_query_len;uint16_t dns_id;

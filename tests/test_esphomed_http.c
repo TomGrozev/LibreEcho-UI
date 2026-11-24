@@ -20,25 +20,45 @@ static int frame_pieces(const char *s,size_t step){size_t n=strlen(s);esp_playba
 /* Whole and byte-at-a-time framing must agree on verdict and payload. */
 static int check_chunks(const char *s){unsigned char whole_payload[64];int whole=frame_pieces(s,strlen(s)?strlen(s):1);size_t n=p.pay_n;assert(n<=sizeof whole_payload);memcpy(whole_payload,p.payload,n);esp_playback_close(&p);
  int bytewise=frame_pieces(s,1);assert(whole==bytewise);if(!whole)assert(p.pay_n==n&&!memcmp(p.payload,whole_payload,n));return whole;}
-/* The split forms the announcement failure was traced to: a read ending
- * inside a chunk-size line (after 1 to 3 digits, and between CR and LF) or
- * inside the final 0\r\n\r\n must not lose what was already parsed. */
-static void split_boundaries(void){
- static const char *cases[]={
+/* Feed the stream at a repeating pattern of read sizes, so a chunk-size line,
+ * its CRLF and the final terminator each land across a read boundary. */
+static int frame_pattern(const char *s,const size_t *piece,size_t pieces){size_t n=strlen(s),i=0,k=0;esp_playback_init(&p);p.chunked=1;p.expected=SIZE_MAX;
+ while(i<n){size_t z=piece[k++%pieces];if(n-i<z)z=n-i;memcpy(p.wire+p.wire_n,s+i,z);p.wire_n+=z;i+=z;if(unframe(&p)<0)return -1;}return p.chunk_stage==CHUNK_DONE?0:-1;}
+/* RFC 9112: a recipient must ignore chunk extensions it does not recognise,
+ * and interior chunk boundaries may fall anywhere in a read. */
+static void chunk_framing(void){
+ unsigned char whole_payload[64];size_t n;
+ /* HA's real shape: a 78-byte WAV-header chunk, then 2048/920/460-byte data
+  * chunks, an extension, a trailer, and every byte boundary tried. */
+ const char *ha="10;name=value\r\n" "RIFF\377\377\377\377WAVEfmt " "\r\n"
+  "2;x=\"a;b\"\r\nab\r\n" "2\r\ncd\r\n" "0\r\nX-Test: yes\r\n\r\n";
+ assert(check_chunks(ha)==0);n=p.pay_n;assert(n<=sizeof whole_payload);memcpy(whole_payload,p.payload,n);
+ assert(n==20&&!memcmp(whole_payload,"RIFF\377\377\377\377WAVEfmt ",16)&&!memcmp(whole_payload+16,"abcd",4));esp_playback_close(&p);
+ static const size_t pattern[]={1,3,1448,2,7,2048};
+ assert(frame_pattern(ha,pattern,sizeof pattern/sizeof *pattern)==0);
+ assert(p.pay_n==n&&!memcmp(p.payload,whole_payload,n));esp_playback_close(&p);
+ /* The split forms the announcement failure was traced to: a read ending
+  * inside a chunk-size line (after 1 to 3 digits, and between CR and LF) or
+  * inside the final 0\r\n\r\n must not lose what was already parsed. */
+ static const char *split_cases[]={
   "1\r\nx\r\n2\r\nyz\r\n0\r\n\r\n",
   "10\r\n0123456789abcdef\r\n0\r\n\r\n",
   "3\r\nabc\r\n0\r\n\r\n",
   "3\r\nabc\r\n0\r\nX: 1\r\n\r\n"};
- for(unsigned i=0;i<sizeof cases/sizeof *cases;i++){
-  assert(check_chunks(cases[i])==0);
-  size_t len=strlen(cases[i]);
+ for(unsigned i=0;i<sizeof split_cases/sizeof *split_cases;i++){
+  assert(check_chunks(split_cases[i])==0);
+  size_t len=strlen(split_cases[i]);
   /* Every single cut point, so the CRLF and the terminator each straddle one. */
   for(size_t cut=1;cut<len;cut++){esp_playback_init(&p);p.chunked=1;p.expected=SIZE_MAX;
-   memcpy(p.wire,cases[i],cut);p.wire_n=cut;assert(unframe(&p)>=0);
-   size_t kept=p.wire_n;memcpy(p.wire+kept,cases[i]+cut,len-cut);p.wire_n=kept+len-cut;assert(unframe(&p)>=0);
+   memcpy(p.wire,split_cases[i],cut);p.wire_n=cut;assert(unframe(&p)>=0);
+   size_t kept=p.wire_n;memcpy(p.wire+kept,split_cases[i]+cut,len-cut);p.wire_n=kept+len-cut;assert(unframe(&p)>=0);
    assert(p.chunk_stage==CHUNK_DONE);esp_playback_close(&p);}
  }
- puts("Chunk-size lines, CRLF and the final terminator split at every boundary: OK");
+ /* Extensions alone do not excuse a bad size, a bad terminator or a bad trailer. */
+ static const char *bad_ext[]={"z;ext=1\r\nabc\r\n0\r\n\r\n",";ext\r\nabc\r\n0\r\n\r\n",
+  "3;ext=1\r\nabc\r\n0\r\n\r\nextra","3;ext=1\r\nabc\r\n0\r\nInvalid trailer\r\n\r\n"};
+ for(unsigned i=0;i<sizeof bad_ext/sizeof *bad_ext;i++)assert(check_chunks(bad_ext[i])==-1);
+ puts("Chunk extensions, split size lines/CRLF/terminator and trailers: OK");
 }
 /* The server side: one response, released to the client a prefix at a time. */
 static unsigned char resp[4U*1024U*1024U];static size_t resp_n,resp_sent,resp_allow;static int peer=-1,want_shut,shut_done;
@@ -214,9 +234,9 @@ int main(int argc,char **argv){
  assert(check_header("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n")==-1);
  assert(check_header("HTTP/1.1 404 Not Found\r\n\r\n")==-1);
  assert(check_chunks("3\r\nabc\r\n2\r\nde\r\n0\r\nX-Test: yes\r\n\r\n")==0);assert(p.pay_n==5);assert(!memcmp(p.payload,"abcde",5));esp_playback_close(&p);
- static const char *bad[]={"", "0\r\n", "3\r\nab\r\n0\r\n\r\n", "z\r\nabc\r\n0\r\n\r\n", "FFFFFFFFFFFFFFFF\r\n", "1\r\naXX0\r\n\r\n", "0\r\n\r\nextra", "0\r\nInvalid trailer\r\n\r\n", "3;ext=1\r\nabc\r\n0\r\n\r\n", "\r\n"};
+ static const char *bad[]={"", "0\r\n", "3\r\nab\r\n0\r\n\r\n", "z\r\nabc\r\n0\r\n\r\n", "FFFFFFFFFFFFFFFF\r\n", "1\r\naXX0\r\n\r\n", "0\r\n\r\nextra", "0\r\nInvalid trailer\r\n\r\n", "\r\n"};
  for(unsigned i=0;i<sizeof bad/sizeof *bad;i++)assert(check_chunks(bad[i])==-1);
- split_boundaries();
+ chunk_framing();
  puts("HTTP header ceiling and bounded chunked decoding, whole and byte by byte: OK");
  /* Run the untouched external capture first so RED identifies the real bug. */
  if(argc==2)ffmpeg_wav(argv[1]);else assert(argc==1);
