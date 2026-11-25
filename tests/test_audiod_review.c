@@ -37,6 +37,23 @@ static void require_condition(int condition, const char *message)
 }
 
 static int codec_raw, codec_writes, codec_fail;
+static const char *const codec_switch_names[4] = {
+    "ADC1 PGA Capture Switch", "ADC2 PGA Capture Switch",
+    "ADC3 PGA Capture Switch", "ADC4 PGA Capture Switch"
+};
+static int codec_switch_values[4];
+static int codec_switch_writes;
+
+static int codec_switch_index(const char *name)
+{
+    int i;
+
+    for (i = 0; i < 4; ++i)
+        if (!strcmp(name, codec_switch_names[i]))
+            return i;
+    return -1;
+}
+
 static int codec_log[16], codec_log_count;
 static int codec_enum, enum_raw, enum_writes;
 static int review_ioctl(int fd, unsigned long request, ...)
@@ -48,6 +65,22 @@ static int review_ioctl(int fd, unsigned long request, ...)
     va_end(ap);
     if (fd != 100000) return (int)syscall(SYS_ioctl, fd, request, arg);
     if (codec_fail) { errno = EIO; return -1; }
+    if (request == SNDRV_CTL_IOCTL_ELEM_READ ||
+        request == SNDRV_CTL_IOCTL_ELEM_WRITE) {
+        struct snd_ctl_elem_value *elem = arg;
+        int index = codec_switch_index((const char *)elem->id.name);
+
+        if (index >= 0) {
+            if (request == SNDRV_CTL_IOCTL_ELEM_WRITE) {
+                codec_switch_values[index] =
+                    (int)elem->value.integer.value[0];
+                codec_switch_writes++;
+            } else {
+                elem->value.integer.value[0] = codec_switch_values[index];
+            }
+            return 0;
+        }
+    }
     if (request == SNDRV_CTL_IOCTL_ELEM_INFO) {
         static const char *const items[] = { "Off", "HP", "Speaker" };
         struct snd_ctl_elem_info *info = arg;
@@ -94,6 +127,70 @@ static void fixture_codec(struct audio_hw *audio)
 {
     codec_raw = 0; codec_writes = 0; codec_fail = 0; codec_log_count = 0;
     fixture_restart_codec(audio);
+}
+
+static void fixture_lidar_codec_switches(struct audio_hw *audio, int open)
+{
+    int i;
+
+    memset(audio, 0, sizeof(*audio));
+    audio->ctl_fd = 100000;
+    audio->codec_switch_count = 4;
+    codec_fail = 0;
+    codec_switch_writes = 0;
+    for (i = 0; i < 4; ++i) {
+        struct audio_control *control = &audio->codec_switches[i];
+
+        control->found = control->writable = 1;
+        snprintf(control->name, sizeof(control->name), "%s",
+                 codec_switch_names[i]);
+        snprintf((char *)control->id.name, sizeof(control->id.name), "%s",
+                 codec_switch_names[i]);
+        control->info.type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+        control->info.count = 2;
+        codec_switch_values[i] = open;
+    }
+}
+
+static void test_lidar_codec_switch_mute(void)
+{
+    struct audio_hw audio;
+    int i;
+
+    fixture_lidar_codec_switches(&audio, 1);
+    require_condition(audio_set_mute(&audio, 1) == 0 && codec_switch_writes == 4,
+                      "mute writes every codec PGA switch");
+    for (i = 0; i < 4; ++i)
+        require_condition(codec_switch_values[i] == 0,
+                          "mute closes every ADC lane");
+    require_condition(audio.muted == 1, "mute is reported");
+
+    fixture_lidar_codec_switches(&audio, 0);
+    audio.muted = 1;
+    require_condition(audio_set_mute(&audio, 0) == 0 && codec_switch_writes == 4,
+                      "unmute writes every codec PGA switch");
+    for (i = 0; i < 4; ++i)
+        require_condition(codec_switch_values[i] == 1,
+                          "unmute opens every ADC lane");
+
+    codec_switch_values[2] = 0;
+    refresh_state(&audio);
+    require_condition(audio.muted == 1, "one closed ADC switch reports muted");
+    for (i = 0; i < 4; ++i)
+        codec_switch_values[i] = 1;
+    refresh_state(&audio);
+    require_condition(audio.muted == 0, "all open ADC switches report unmuted");
+
+    /* An unmuted boot must clear the codec default the mixers left behind. */
+    fixture_lidar_codec_switches(&audio, 0);
+    audio.have_card_info = 1;
+    require_condition(setenv("LE_AUDIO_MIC_MUTED", "0", 1) == 0,
+                      "unmuted boot fixture");
+    apply_persisted_levels(&audio);
+    unsetenv("LE_AUDIO_MIC_MUTED");
+    for (i = 0; i < 4; ++i)
+        require_condition(codec_switch_values[i] == 1,
+                          "unmuted boot opens every ADC lane");
 }
 
 static void assert_published(int value, const char *message)
@@ -1329,6 +1426,8 @@ int main(void)
 
     test_physical_reference_range();
     test_lidar_speaker_levels();
+    test_lidar_codec_switch_mute();
+
     test_lidar_output_route_enum();
     test_codec_pga_gain();
     test_startup_runtime_and_reference();

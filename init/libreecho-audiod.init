@@ -28,6 +28,18 @@ config_number() {
     printf '%s\n' "$value"
 }
 
+config_bool() {
+    key=$1
+    fallback=$2
+    value=
+    if [ -r "$CONFIG" ]; then
+        value=$(sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\([a-z]*\).*/\1/p" \
+            "$CONFIG" | sed -n '1p')
+    fi
+    case "$value" in true) value=1 ;; false) value=0 ;; *) value=$fallback ;; esac
+    printf '%s\n' "$value"
+}
+
 # The codec powers up at its own default, and audiod only ever read the mixer,
 # so a gain set through the API survived in web-config.json while the hardware
 # quietly reverted on every boot.  The configured VAD floor is chosen for a
@@ -63,8 +75,10 @@ wait_for_capture_path() {
 apply_persisted_levels() {
     LE_AUDIO_MIC_GAIN=$(config_number microphone_gain "")
     LE_AUDIO_VOLUME=$(config_number volume "")
+    LE_AUDIO_MIC_MUTED=$(config_bool microphone_muted "")
     [ -n "$LE_AUDIO_MIC_GAIN" ] && export LE_AUDIO_MIC_GAIN
     [ -n "$LE_AUDIO_VOLUME" ] && export LE_AUDIO_VOLUME
+    [ -n "$LE_AUDIO_MIC_MUTED" ] && export LE_AUDIO_MIC_MUTED
     return 0
 }
 

@@ -238,6 +238,11 @@ struct audio_control {
     char name[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
 };
 
+/* The Lidar codec exposes one PGA volume and one PGA capture switch per ADC.
+ * Keep them all so mute and gain reach every microphone lane, not only the
+ * first codec the enumeration happened to visit. */
+#define AUDIO_CODEC_CONTROLS 8
+
 struct audio_hw {
     int card;
     int ctl_fd;
@@ -246,6 +251,10 @@ struct audio_hw {
     struct audio_control master;
     struct audio_control capture;
     struct audio_control capture_switch;
+    struct audio_control codec_switches[AUDIO_CODEC_CONTROLS];
+    int codec_switch_count;
+    struct audio_control codec_volumes[AUDIO_CODEC_CONTROLS];
+    int codec_volume_count;
     struct audio_control amplifier_switch;
     struct audio_control output_route;
     /* Lidar only: the DAC reaches the line-out drivers through the output
@@ -742,6 +751,16 @@ static void select_control(struct audio_control *selected,
     selected->name[sizeof(selected->name) - 1] = '\0';
 }
 
+static void add_codec_control(struct audio_control *list, int *count,
+                              const struct snd_ctl_elem_id *id,
+                              const struct snd_ctl_elem_info *info)
+{
+    if (*count >= AUDIO_CODEC_CONTROLS)
+        return;
+    select_control(&list[*count], id, info);
+    (*count)++;
+}
+
 static int enumerate_controls(struct audio_hw *audio)
 {
     struct snd_ctl_elem_list list;
@@ -810,6 +829,20 @@ static int enumerate_controls(struct audio_hw *audio)
         consider_control(&audio->master, &ids[i], &info, 0);
         consider_control(&audio->capture, &ids[i], &info, 1);
         consider_control(&audio->capture_switch, &ids[i], &info, 2);
+        if (audio_profile_lidar) {
+            char name[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
+
+            lower_name(ids[i].name, name, sizeof(name));
+            if (info.type == SNDRV_CTL_ELEM_TYPE_BOOLEAN &&
+                contains(name, "pga capture switch"))
+                add_codec_control(audio->codec_switches,
+                                  &audio->codec_switch_count, &ids[i], &info);
+            else if ((info.type == SNDRV_CTL_ELEM_TYPE_INTEGER ||
+                      info.type == SNDRV_CTL_ELEM_TYPE_INTEGER64) &&
+                     contains(name, "pga capture volume"))
+                add_codec_control(audio->codec_volumes,
+                                  &audio->codec_volume_count, &ids[i], &info);
+        }
     }
     free(ids);
     return 0;
@@ -1134,8 +1167,20 @@ static void refresh_state(struct audio_hw *audio)
                       : audio->capture.info.value.integer.max;
         audio->gain = percent_from_range(value, min, max);
     }
-    if (read_control_value(audio, &audio->capture_switch, &value) == 0)
+    if (audio->codec_switch_count > 0) {
+        int muted = 0;
+        int i;
+
+        for (i = 0; i < audio->codec_switch_count; ++i) {
+            if (read_control_value(audio, &audio->codec_switches[i], &value) == 0 &&
+                (audio->codec_switches[i].mute_semantics ? value != 0
+                                                         : value == 0))
+                muted = 1;
+        }
+        audio->muted = muted;
+    } else if (read_control_value(audio, &audio->capture_switch, &value) == 0) {
         audio->muted = audio->capture_switch.mute_semantics ? (value != 0) : (value == 0);
+    }
 }
 
 static int amplifier_active(const struct audio_hw *audio)
@@ -1236,8 +1281,22 @@ static int audio_set_volume(struct audio_hw *audio, int volume)
 static int audio_set_gain(struct audio_hw *audio, int gain)
 {
     char setting[16];
+    int i;
+
     if (gain < 0 || gain > 100)
         return -1;
+    /*
+     * Each ADC has its own PGA on this card.  Writing only the first left the
+     * other codecs at micd's level -- measured as +26 dB on ADC1 alone -- so
+     * apply the owner's gain to every per-codec volume.
+     */
+    if (audio->codec_volume_count > 0) {
+        for (i = 0; i < audio->codec_volume_count; ++i)
+            if (write_percent_control(audio, &audio->codec_volumes[i], gain) < 0)
+                return -1;
+        audio->gain = gain;
+        return 0;
+    }
     if (write_percent_control(audio, &audio->capture, gain) < 0) {
         (void)snprintf(setting, sizeof(setting), "%d%%", gain);
         if (run_amixer(audio,
@@ -1252,6 +1311,20 @@ static int audio_set_gain(struct audio_hw *audio, int gain)
 static int audio_set_mute(struct audio_hw *audio, int muted)
 {
     const char *setting = muted ? "nocap" : "cap";
+    int i;
+
+    /*
+     * The privacy latch mutes through this path, so an unmute has to clear
+     * every per-codec switch.  Clearing only the first left the remaining
+     * ADC lanes silent after the latch dropped.
+     */
+    if (audio->codec_switch_count > 0) {
+        for (i = 0; i < audio->codec_switch_count; ++i)
+            if (write_switch_control(audio, &audio->codec_switches[i], muted) < 0)
+                return -1;
+        audio->muted = !!muted;
+        return 0;
+    }
     if (write_switch_control(audio, &audio->capture_switch, muted) < 0) {
         if (run_amixer(audio,
                        control_name_or_default(&audio->capture_switch,
@@ -1300,6 +1373,23 @@ static int level_from_environment(const char *name, int *value)
     return 1;
 }
 
+static int boolean_from_environment(const char *name, int *value)
+{
+    const char *text = getenv(name);
+
+    if (!text || !text[0])
+        return 0;
+    if (!strcmp(text, "1") || !strcmp(text, "true")) {
+        *value = 1;
+        return 1;
+    }
+    if (!strcmp(text, "0") || !strcmp(text, "false")) {
+        *value = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static int audio_load_logical_volume(struct audio_hw *audio)
 {
     char text[8], canonical[8];
@@ -1339,6 +1429,15 @@ static void apply_persisted_levels(struct audio_hw *audio)
             le_log_info("audiod: restored microphone gain %d", value);
         else
             le_log_warn("audiod: unable to restore microphone gain %d", value);
+    }
+    /* micd no longer opens the codec PGA switches, so the boot state of the
+     * persisted privacy mute has to be written here or an unmuted boot stays
+     * silent. */
+    if (boolean_from_environment("LE_AUDIO_MIC_MUTED", &value)) {
+        if (audio_set_mute(audio, value) == 0)
+            le_log_info("audiod: restored microphone mute %d", value);
+        else
+            le_log_warn("audiod: unable to restore microphone mute %d", value);
     }
     /* The runtime file is the last successful button/API choice. The config
      * environment is a boot fallback, not a restart-time override. */
