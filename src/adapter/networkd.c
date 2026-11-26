@@ -69,6 +69,10 @@
 #define SCAN_POLL_MS 1800
 #define ASSOCIATION_POLL_MS 100
 #define WPA_TIMEOUT_MS 2500
+/* Roam off a weak AP: scan every 30s, leave below -65 dBm, retry every 300s
+ * while no better BSS is visible.  Must match the profiles libreecho-wifi
+ * writes; wpa_supplicant only roams when built with CONFIG_BGSCAN_SIMPLE. */
+#define WPA_BGSCAN "simple:30:-65:300"
 #define WEXT_SCAN_BUFFER_SIZE 65535
 #define WEXT_SCAN_RETRY_MS 100
 /* Overall deadline for a direct kernel scan.  The adapter client that carries
@@ -596,6 +600,46 @@ static int wpa_ok(struct daemon_ctx *ctx, const char *command,
 {
     int n = wpa_call(ctx, command, reply, size);
     return n >= 2 && !strncmp(reply, "OK", 2) ? 0 : -1;
+}
+
+static int set_network_bgscan(struct daemon_ctx *ctx, int id)
+{
+    char command[128], reply[WPA_REPLY_MAX];
+    if (id < 0 ||
+        snprintf(command, sizeof(command), "SET_NETWORK %d bgscan \"%s\"\n",
+                 id, WPA_BGSCAN) >= (int)sizeof(command) ||
+        wpa_ok(ctx, command, reply, sizeof(reply)) < 0)
+        return -1;
+    return 0;
+}
+
+/* SAVE_CONFIG rewrites every network block from the in-memory config, so a
+ * profile that predates bgscan would be saved back without it.  Stamp each
+ * network first, then persist. */
+static void apply_bgscan_to_all_networks(struct daemon_ctx *ctx)
+{
+    char reply[WPA_REPLY_MAX], *line, *next;
+    if (wpa_call(ctx, "LIST_NETWORKS\n", reply, sizeof(reply)) < 0)
+        return;
+    line = reply;
+    while (line && *line) {
+        next = strchr(line, '\n');
+        if (next)
+            *next++ = '\0';
+        if (line[0] >= '0' && line[0] <= '9') {
+            int id = (int)strtol(line, NULL, 10);
+            if (set_network_bgscan(ctx, id) < 0)
+                le_log_warn("networkd: bgscan rejected for network %d", id);
+        }
+        line = next;
+    }
+}
+
+static int wpa_save_config(struct daemon_ctx *ctx)
+{
+    char reply[WPA_REPLY_MAX];
+    apply_bgscan_to_all_networks(ctx);
+    return wpa_ok(ctx, "SAVE_CONFIG\n", reply, sizeof(reply));
 }
 
 /* A vendor supplicant can reject SCAN with FAIL-BUSY while a background
@@ -1590,13 +1634,13 @@ static void finish_dhcp(struct daemon_ctx *ctx, int status, int timed_out)
         network_success = success && ctx->state.ip[0];
         if (network_success && previous >= 0 && previous != candidate) {
             remove_network_profile(ctx, previous);
-            if (wpa_ok(ctx, "SAVE_CONFIG\n", reply, sizeof(reply)) < 0) {
+            if (wpa_save_config(ctx) < 0) {
                 (void)wpa_ok(ctx, "RECONFIGURE\n", reply, sizeof(reply));
                 remove_network_profile(ctx, candidate);
                 if (snprintf(command, sizeof(command), "SELECT_NETWORK %d\n",
                              previous) < (int)sizeof(command))
                     (void)wpa_ok(ctx, command, reply, sizeof(reply));
-                (void)wpa_ok(ctx, "SAVE_CONFIG\n", reply, sizeof(reply));
+                (void)wpa_save_config(ctx);
                 ctx->network_id = previous;
                 network_success = 0;
             }
@@ -3425,7 +3469,7 @@ static void restore_network_profile(struct daemon_ctx *ctx, int previous,
         snprintf(command, sizeof(command), "SELECT_NETWORK %d\n", previous) <
             (int)sizeof(command)) {
         (void)wpa_ok(ctx, command, reply, sizeof(reply));
-        (void)wpa_ok(ctx, "SAVE_CONFIG\n", reply, sizeof(reply));
+        (void)wpa_save_config(ctx);
         ctx->network_id = previous;
     } else {
         (void)wpa_ok(ctx, "DISCONNECT\n", reply, sizeof(reply));
@@ -3500,6 +3544,12 @@ static int connect_network(struct daemon_ctx *ctx, const char *ssid,
         restore_network_profile(ctx, *previous_id, id);
         return -7;
     }
+    /* Non-fatal: an old supplicant without CONFIG_BGSCAN_SIMPLE still
+     * accepts and stores the field, yet if a vendor build rejects it the
+     * network should still connect (it just will not roam). */
+    if (set_network_bgscan(ctx, id) < 0)
+        le_log_warn("networkd: wpa_supplicant rejected bgscan for network %d",
+                    id);
     if (snprintf(command, sizeof(command), "ENABLE_NETWORK %d\n", id) >=
             (int)sizeof(command) || wpa_ok(ctx, command, reply, sizeof(reply)) < 0 ||
         snprintf(command, sizeof(command), "SELECT_NETWORK %d\n", id) >=
@@ -3512,7 +3562,6 @@ static int connect_network(struct daemon_ctx *ctx, const char *ssid,
 
 static void finish_association(struct daemon_ctx *ctx, int success)
 {
-    char reply[WPA_REPLY_MAX];
     int fd = ctx->association.client_fd;
     int ci = client_index(ctx, fd);
     int candidate = ctx->association.candidate_network_id;
@@ -3539,7 +3588,7 @@ static void finish_association(struct daemon_ctx *ctx, int success)
         return;
     }
 
-    if (wpa_ok(ctx, "SAVE_CONFIG\n", reply, sizeof(reply)) < 0) {
+    if (wpa_save_config(ctx) < 0) {
         restore_previous_network(ctx);
         /* The profile could not be saved, so the handover cannot proceed: the
          * candidate config was rolled back.  Re-arm the recovery AP exactly as

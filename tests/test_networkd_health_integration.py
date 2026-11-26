@@ -71,8 +71,13 @@ class FakeWpa:
                 response = f"{self.next_network_id}\n"
                 self.next_network_id += 1
             elif command == "LIST_NETWORKS":
-                current = "\t[CURRENT]" if self.connected else ""
-                response = f"network id / ssid / bssid / flags\n0\t{self.saved_ssid}\tany{current}\n"
+                lines = ["network id / ssid / bssid / flags"]
+                for network_id, settings in sorted(self.network_settings.items()):
+                    current = ("\t[CURRENT]" if self.connected and
+                               network_id == self.network_id else "")
+                    ssid = settings.get("ssid", self.saved_ssid)
+                    lines.append(f"{network_id}\t{ssid}\tany{current}")
+                response = "\n".join(lines) + "\n"
             elif command == "DISCONNECT":
                 self.connected = False
                 response = "OK\n"
@@ -441,6 +446,7 @@ def test_connect_directed_scan_is_saved_for_hidden_visible_and_open_networks():
                 assert profile["ssid"] == ssid, profile
                 assert profile["key_mgmt"] == key_mgmt, profile
                 assert profile["scan_ssid"] == "1", profile
+                assert profile["bgscan"] == "simple:30:-65:300", profile
                 if password:
                     assert profile["psk"] == password, profile
                 assert wpa.commands.index("SET_NETWORK 1 scan_ssid 1") < \
@@ -469,6 +475,9 @@ def test_directed_scan_setting_failure_restores_previous_profile():
             assert "scan setting rejected" in result["error"], result
             assert "REMOVE_NETWORK 1" in wpa.commands
             assert "SELECT_NETWORK 0" in wpa.commands
+            # The restored profile is rewritten with the roaming parameter.
+            assert wpa.saved_profiles[0]["bgscan"] == "simple:30:-65:300", \
+                wpa.saved_profiles
             assert wpa.network_id == 0
             assert wpa.connected is True
         finally:
