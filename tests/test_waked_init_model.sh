@@ -65,14 +65,15 @@ run() {
     WAKE_MODEL_SETTLE_SECONDS=1 timeout 20 sh "$INIT" "$1" 2>>"$T/stderr"
 }
 
-# The daemon writes its arguments from a background process, so give it a
-# moment to appear before the file is read.
+# The fake start-stop-daemon backgrounds the daemon, which writes its argv a
+# moment later; wait for that many records instead of racing it. A start that
+# falls back on the stock model adds a second record after its settle delay.
 wait_args() {
-    wanted=$1
-    tries=0
-    while [ "$(wc -l <"$T/args")" -lt "$wanted" ] && [ "$tries" -lt 50 ]; do
+    need=${1:-1}
+    count=0
+    while [ "$(wc -l <"$T/args")" -lt "$need" ] && [ "$count" -lt 100 ]; do
         sleep 0.1
-        tries=$((tries + 1))
+        count=$((count + 1))
     done
 }
 
