@@ -92,7 +92,7 @@ class SettingsCommands(Settings):
   self.assertEqual([f[2] for t,f in got if t==26 and f.get(1)==struct.pack('<I',WAKE_SWITCH)][-1],0)
   self.assertEqual(json.loads(self.config.read_text())['esphome_active_wake_word'],'')
   self.s.sendall(switch_command(WAKE_SWITCH,True))
-  self.assertEqual(self.wait_call('wake','set_word'),{'word':'Alexa'})
+  self.assertFalse(any(r['cmd']=='set_word' for r in self.adapters['wake'].calls),'enabling wake mirrors the loaded model, it does not reload its word')
   got=self.read_until(lambda t,f:t==26 and f.get(1)==struct.pack('<I',WAKE_SWITCH) and f.get(2)==1)
   self.assertTrue(any(t==26 and f.get(2)==1 for t,f in got),'wake switch on not reported')
   self.assertEqual(json.loads(self.config.read_text())['esphome_active_wake_word'],'alexa_v0.1')

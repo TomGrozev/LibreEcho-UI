@@ -66,7 +66,7 @@ class PinnedFixture(Fixture):
    await asyncio.sleep(.01)
   self.assertTrue((await announce).success);self.assertEqual(self.sound(),struct.pack('<h',1900)*2000);await self.wait_for(lambda:len(starts)==4,'remote START_CONVERSATION with wake disabled');self.assertEqual(starts[-1],('',1,None))
   unsubscribe();await self.wait_for(lambda:sum(r['cmd']=='remote_clear' for r in self.adapters['timer'].calls)==clears+1,'unsubscribe ownership cleanup');self.assertFalse(json.loads((self.p/'status.json').read_text())['in_progress'])
-  await client.set_voice_assistant_configuration(['alexa_v0.1']);cfg=await client.get_voice_assistant_configuration(3);self.assertEqual(cfg.active_wake_words,['alexa_v0.1']);self.assertEqual(self.wait_call('wake','set_word')['args'],{'word':'Alexa'})
+  await client.set_voice_assistant_configuration(['alexa_v0.1']);cfg=await client.get_voice_assistant_configuration(3);self.assertEqual(cfg.active_wake_words,['alexa_v0.1']);self.assertEqual(json.loads(self.config.read_text())['esphome_active_wake_word'],'alexa_v0.1');self.assertFalse(any(r['cmd']=='set_word' for r in self.adapters['wake'].calls),'selection writes the selection file and restarts, it does not reload set_word')
   client.subscribe_voice_assistant(handle_start=start,handle_stop=stop,handle_audio=capture);await asyncio.sleep(.05);await client.disconnect();await self.wait_for(lambda:sum(r['cmd']=='remote_clear' for r in self.adapters['timer'].calls)==clears+2,'disconnect ownership cleanup');self.assertFalse(json.loads((self.p/'status.json').read_text())['in_progress']);await client.connect(login=True)
  def test_pinned_plain_real_login_entities_ping_disconnect(self):
   self.s.close();time.sleep(.05)

@@ -13,14 +13,16 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$T/bin" "$T/root/usr/local/sbin" "$T/models"
-STOCK=$T/root/usr/local/share/libreecho/openwakeword
-model() {
+STOCK=$T/root/usr/local/share/libreecho/wakeword
+STOCK_WORD=$STOCK/alexa
+# word <dir> <name>: the microWakeWord pair the contract expects.
+word() {
     mkdir -p "$1"
-    for f in melspectrogram.onnx embedding_model.onnx alexa_v0.1.onnx; do
-        echo onnx >"$1/$f"
-    done
+    echo tflite >"$1/$2.tflite"
+    echo json >"$1/$2.json"
 }
-model "$STOCK"
+word "$STOCK_WORD" alexa
+word "$STOCK/vad" vad
 : >"$T/payload"
 printf '#!/bin/sh\nexit 0\n' >"$T/bin/mount"
 cp "$T/bin/mount" "$T/bin/umount"
@@ -63,11 +65,23 @@ run() {
     WAKE_MODEL_SETTLE_SECONDS=1 timeout 20 sh "$INIT" "$1" 2>>"$T/stderr"
 }
 
+# The daemon writes its arguments from a background process, so give it a
+# moment to appear before the file is read.
+wait_args() {
+    wanted=$1
+    tries=0
+    while [ "$(wc -l <"$T/args")" -lt "$wanted" ] && [ "$tries" -lt 50 ]; do
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+}
+
 # expect <case> <model-dir> [<model-dir> ...]: each start's --model-dir, in order.
 expect() {
     name=$1; shift
     : >"$T/args"
     run start
+    wait_args "$#"
     count=0
     for dir in "$@"; do
         count=$((count + 1))
@@ -84,29 +98,43 @@ expect() {
     echo "waked init: $name"
 }
 
-expect "no selection runs the stock model" "$STOCK"
+expect "no selection runs the stock model" "$STOCK_WORD"
+[ ! -e "$T/models/vad" ] || { echo "FAIL: VAD seeded without an owner model" >&2; exit 1; }
 
-model "$T/models/mine"
+word "$T/models/mine" mine
 echo mine >"$T/wake-model"
 expect "a staged model is selected" "$T/models/mine"
+# The engine takes the shared VAD model from the selected word's parent.
+[ -f "$T/models/vad/vad.tflite" ] && [ -f "$T/models/vad/vad.json" ] || {
+    echo "FAIL: the owner VAD model was not seeded" >&2; exit 1; }
+rm -rf "$T/models/vad"
 
 echo "../mine" >"$T/wake-model"
-expect "a path-like model name falls back to stock" "$STOCK"
+expect "a path-like model name falls back to stock" "$STOCK_WORD"
 
-model "$T/models/partial"
-rm "$T/models/partial/alexa_v0.1.onnx"
+word "$T/models/partial" partial
+rm "$T/models/partial/partial.tflite"
 echo partial >"$T/wake-model"
-expect "an incomplete model falls back to stock" "$STOCK"
+expect "an incomplete model falls back to stock" "$STOCK_WORD"
 
-model "$T/models/linked"
-rm "$T/models/linked/alexa_v0.1.onnx"
-ln -s "$STOCK/alexa_v0.1.onnx" "$T/models/linked/alexa_v0.1.onnx"
+word "$T/models/linked" linked
+rm "$T/models/linked/linked.tflite"
+ln -s "$STOCK_WORD/alexa.tflite" "$T/models/linked/linked.tflite"
 echo linked >"$T/wake-model"
-expect "a symlinked model file falls back to stock" "$STOCK"
+expect "a symlinked model file falls back to stock" "$STOCK_WORD"
 
-model "$T/models/bad-load"
+# A half-seeded owner VAD copy is completed from the payload, so an
+# interrupted first run does not strand the owner model.
+mkdir -p "$T/models/vad"
+echo stale >"$T/models/vad/vad.tflite"
+echo mine >"$T/wake-model"
+expect "a partial owner VAD copy is refreshed" "$T/models/mine"
+[ -f "$T/models/vad/vad.json" ] || { echo "FAIL: the VAD manifest was not seeded" >&2; exit 1; }
+rm -rf "$T/models/vad"
+
+word "$T/models/bad-load" bad-load
 echo bad-load >"$T/wake-model"
-expect "a model that fails to load restarts on stock" "$T/models/bad-load" "$STOCK"
+expect "a model that fails to load restarts on stock" "$T/models/bad-load" "$STOCK_WORD"
 grep -q "owner-staged model failed to start; using stock model" "$T/stderr"
 
 # expect_second <case> <folder-or-empty>: the last start's --second-model-dir,
@@ -115,6 +143,7 @@ expect_second() {
     name=$1; folder=$2
     : >"$T/args"
     run start
+    wait_args 1
     line=$(tail -n 1 "$T/args")
     if [ -n "$folder" ]; then
         case "$line" in
@@ -137,7 +166,10 @@ echo mine >"$T/wake-second"
 expect_second "a staged folder is the second word" "$T/models/mine"
 echo "../mine" >"$T/wake-second"
 expect_second "a path-like second word is ignored" ""
+word "$T/models/linked" linked
+rm "$T/models/linked/linked.tflite"
+ln -s "$STOCK_WORD/alexa.tflite" "$T/models/linked/linked.tflite"
 echo linked >"$T/wake-second"
-expect_second "a second word with a symlinked classifier is ignored" ""
+expect_second "a second word with a symlinked model is ignored" ""
 echo missing >"$T/wake-second"
 expect_second "a second word with no folder is ignored" ""

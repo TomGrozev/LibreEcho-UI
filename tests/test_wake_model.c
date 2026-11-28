@@ -1,15 +1,16 @@
 /*
  * Owner-staged wake model contract: name rules, the labels waked reports, the
- * ONNX graph checks, and the web store's stage, commit, select and delete
- * flow. The ONNX files are synthesised here with a small protobuf writer so
- * every rejection path has a known-bad model to reject.
+ * microWakeWord manifest and FlatBuffer checks, and the web store's stage,
+ * commit, select and delete flow. The .tflite files are synthesised here with
+ * a small FlatBuffer writer so every rejection path has a known-bad model to
+ * reject.
  */
 #define _POSIX_C_SOURCE 200809L
 
 #include "wake_model.h"
 #include "wake_model_store.h"
 
-#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,148 +29,197 @@ static int checks;
         }                                                                       \
     } while (0)
 
-/* ---- protobuf writer ---- */
+/* ---- FlatBuffer writer ---- */
 
-struct writer {
+struct fb {
     unsigned char *p;
-    size_t n;
+    size_t len;
     size_t cap;
+    int bad;
 };
 
-static void put_byte(struct writer *w, unsigned char b)
+static size_t fb_alloc(struct fb *b, size_t n)
 {
-    if (w->n < w->cap)
-        w->p[w->n] = b;
-    ++w->n;
-}
+    size_t pos;
 
-static void put_varint(struct writer *w, unsigned long long v)
-{
-    while (v >= 0x80) {
-        put_byte(w, (unsigned char)(v | 0x80));
-        v >>= 7;
+    while (b->len % 4 && b->len < b->cap)
+        b->p[b->len++] = 0;
+    pos = b->len;
+    if (n > b->cap - b->len) {
+        b->bad = 1;
+        b->len = b->cap;
+        return pos;
     }
-    put_byte(w, (unsigned char)v);
+    memset(b->p + pos, 0, n);
+    b->len += n;
+    return pos;
 }
 
-static void put_tag(struct writer *w, unsigned field, unsigned wire)
+static void fb_u16(struct fb *b, size_t at, unsigned value)
 {
-    put_varint(w, ((unsigned long long)field << 3) | wire);
+    if (at + 2 > b->cap)
+        return;
+    b->p[at] = (unsigned char)(value & 0xffu);
+    b->p[at + 1] = (unsigned char)((value >> 8) & 0xffu);
 }
 
-static void put_message(struct writer *w, unsigned field, const struct writer *sub)
+static void fb_u32(struct fb *b, size_t at, uint32_t value)
 {
+    if (at + 4 > b->cap)
+        return;
+    b->p[at] = (unsigned char)(value & 0xffu);
+    b->p[at + 1] = (unsigned char)((value >> 8) & 0xffu);
+    b->p[at + 2] = (unsigned char)((value >> 16) & 0xffu);
+    b->p[at + 3] = (unsigned char)((value >> 24) & 0xffu);
+}
+
+/* An inline field lives in a 4-byte slot at table + 4 + 4 * field. */
+static void fb_field(struct fb *b, size_t table, unsigned field, uint32_t value)
+{
+    fb_u32(b, table + 4 + 4 * (size_t)field, value);
+}
+
+static void fb_field_offset(struct fb *b, size_t table, unsigned field, size_t child)
+{
+    size_t at = table + 4 + 4 * (size_t)field;
+    fb_u32(b, at, (uint32_t)(child - at));
+}
+
+/* Vtables are written after the table and its children; FlatBuffers allows a
+ * negative soffset, and the validator bounds-checks either direction. */
+static void fb_table_end(struct fb *b, size_t table, unsigned fields, const int *present)
+{
+    size_t vtable = fb_alloc(b, 4 + 2 * (size_t)fields);
+    unsigned i;
+
+    fb_u16(b, vtable, 4 + 2 * fields);
+    fb_u16(b, vtable + 2, 4 + 4 * fields);
+    for (i = 0; i < fields; ++i)
+        fb_u16(b, vtable + 4 + 2 * (size_t)i, present[i] ? 4 + 4 * i : 0);
+    fb_u32(b, table, (uint32_t)(int32_t)((long long)table - (long long)vtable));
+}
+
+static size_t fb_int_vector(struct fb *b, const int32_t *values, size_t count)
+{
+    size_t vector = fb_alloc(b, 4 + 4 * count);
     size_t i;
 
-    put_tag(w, field, 2);
-    put_varint(w, sub->n);
-    for (i = 0; i < sub->n && i < sub->cap; ++i)
-        put_byte(w, sub->p[i]);
+    fb_u32(b, vector, (uint32_t)count);
+    for (i = 0; i < count; ++i)
+        fb_u32(b, vector + 4 + 4 * i, (uint32_t)values[i]);
+    return vector;
 }
 
-static void put_string(struct writer *w, unsigned field, const char *text)
+/* A vector of offsets; child tables must be written after the call. */
+static size_t fb_table_vector(struct fb *b, size_t count)
 {
-    struct writer sub = {(unsigned char *)text, strlen(text), strlen(text)};
-
-    put_message(w, field, &sub);
+    size_t vector = fb_alloc(b, 4 + 4 * count);
+    fb_u32(b, vector, (uint32_t)count);
+    return vector;
 }
 
-static void put_uint(struct writer *w, unsigned field, unsigned long long value)
+static void fb_vector_entry(struct fb *b, size_t vector, size_t index, size_t child)
 {
-    put_tag(w, field, 0);
-    put_varint(w, value);
+    size_t at = vector + 4 + 4 * index;
+    fb_u32(b, at, (uint32_t)(child - at));
 }
 
-/* ---- model builder ---- */
+/* ---- TFLite model builder ---- */
 
 struct model_spec {
-    const char *input;
-    const char *output;
-    const char *ops[6];
-    int op_count;
-    unsigned long long opset;
-    int external;
-    size_t pad;
+    unsigned builtin;         /* builtin_code of the one operator code */
+    int opcode_index;         /* Operator.opcode_index */
+    unsigned input_type;      /* TensorType (int8 = 9) */
+    int32_t input_dims[3];
+    size_t input_dim_count;
+    unsigned output_type;     /* TensorType (uint8 = 3) */
+    int32_t output_dims[2];
+    size_t output_dim_count;
+    int subgraph_count;
 };
+
+static const struct model_spec good_model = {
+    14, /* LOGISTIC */
+    0,
+    9, {1, 3, 40}, 3,
+    3, {1, 1}, 2,
+    1,
+};
+
+static size_t tensor_table(struct fb *b, unsigned type, const int32_t *dims, size_t count)
+{
+    int present[2] = {1, 1};
+    size_t table = fb_alloc(b, 4 + 4 * 2);
+    size_t shape = fb_int_vector(b, dims, count);
+
+    fb_field_offset(b, table, 0, shape);
+    fb_field(b, table, 1, type);
+    fb_table_end(b, table, 2, present);
+    return table;
+}
+
+static size_t operator_table(struct fb *b, int opcode_index)
+{
+    int present[1] = {1};
+    size_t table = fb_alloc(b, 4 + 4);
+    fb_field(b, table, 0, (uint32_t)opcode_index);
+    fb_table_end(b, table, 1, present);
+    return table;
+}
+
+static size_t subgraph_table(struct fb *b, const struct model_spec *spec)
+{
+    int present[4] = {1, 1, 1, 1};
+    size_t table = fb_alloc(b, 4 + 4 * 4);
+    size_t tensors = fb_table_vector(b, 2);
+    size_t inputs, outputs, operators;
+    int32_t input_index = 0, output_index = 1;
+
+    fb_vector_entry(b, tensors, 0,
+                    tensor_table(b, spec->input_type, spec->input_dims,
+                                 spec->input_dim_count));
+    fb_vector_entry(b, tensors, 1,
+                    tensor_table(b, spec->output_type, spec->output_dims,
+                                 spec->output_dim_count));
+    fb_field_offset(b, table, 0, tensors);
+    inputs = fb_int_vector(b, &input_index, 1);
+    fb_field_offset(b, table, 1, inputs);
+    outputs = fb_int_vector(b, &output_index, 1);
+    fb_field_offset(b, table, 2, outputs);
+    operators = fb_table_vector(b, 1);
+    fb_vector_entry(b, operators, 0, operator_table(b, spec->opcode_index));
+    fb_field_offset(b, table, 3, operators);
+    fb_table_end(b, table, 4, present);
+    return table;
+}
 
 static size_t build_model(unsigned char *out, size_t cap, const struct model_spec *spec)
 {
-    static unsigned char graph_bytes[8192];
-    static unsigned char model_bytes[16384];
-    struct writer graph = {graph_bytes, 0, sizeof(graph_bytes)};
-    struct writer model = {model_bytes, 0, sizeof(model_bytes)};
-    struct writer opset = {NULL, 0, 0};
-    unsigned char opset_bytes[32];
+    struct fb b = {out, 0, cap, 0};
+    size_t root, model, codes, code, subgraphs;
+    int present_model[8] = {0}, present_code[4] = {0, 0, 0, 1};
     int i;
 
-    for (i = 0; i < spec->op_count; ++i) {
-        struct writer node = {NULL, 0, 0};
-        unsigned char node_bytes[256];
-        char produced[32];
-
-        node.p = node_bytes;
-        node.cap = sizeof(node_bytes);
-        node.n = 0;
-        put_string(&node, 1, spec->input);
-        if (i == spec->op_count - 1)
-            put_string(&node, 2, spec->output);
-        else {
-            snprintf(produced, sizeof(produced), "t%d", i);
-            put_string(&node, 2, produced);
-        }
-        put_string(&node, 4, spec->ops[i]);
-        put_message(&graph, 1, &node);
-    }
-    if (spec->external) {
-        struct writer tensor = {NULL, 0, 0};
-        unsigned char tensor_bytes[64];
-        tensor.p = tensor_bytes;
-        tensor.cap = sizeof(tensor_bytes);
-        put_string(&tensor, 8, "weights");
-        put_uint(&tensor, 14, 1);
-        put_message(&graph, 5, &tensor);
-    }
-    {
-        struct writer value = {NULL, 0, 0};
-        unsigned char value_bytes[128];
-        value.p = value_bytes;
-        value.cap = sizeof(value_bytes);
-        put_string(&value, 1, spec->input);
-        put_message(&graph, 11, &value);
-    }
-    {
-        struct writer value = {NULL, 0, 0};
-        unsigned char value_bytes[128];
-        value.p = value_bytes;
-        value.cap = sizeof(value_bytes);
-        put_string(&value, 1, spec->output);
-        put_message(&graph, 12, &value);
-    }
-    opset.p = opset_bytes;
-    opset.cap = sizeof(opset_bytes);
-    put_uint(&opset, 2, spec->opset);
-    put_message(&model, 8, &opset);
-    put_message(&model, 7, &graph);
-    {
-        /* Padding keeps the file above the minimum size. */
-        size_t j;
-        unsigned char *pad = malloc(spec->pad + 1);
-        struct writer doc = {NULL, 0, 0};
-
-        if (pad) {
-            for (j = 0; j < spec->pad; ++j)
-                pad[j] = 'x';
-            doc.p = pad;
-            doc.cap = spec->pad;
-            doc.n = spec->pad;
-            put_message(&model, 6, &doc);
-            free(pad);
-        }
-    }
-    if (model.n > cap)
+    root = fb_alloc(&b, 4);
+    model = fb_alloc(&b, 4 + 4 * 8);
+    codes = fb_table_vector(&b, 1);
+    code = fb_alloc(&b, 4 + 4 * 4);
+    fb_field(&b, code, 3, spec->builtin);
+    fb_table_end(&b, code, 4, present_code);
+    fb_vector_entry(&b, codes, 0, code);
+    fb_field_offset(&b, model, 1, codes);
+    subgraphs = fb_table_vector(&b, (size_t)(spec->subgraph_count > 0 ? spec->subgraph_count : 1));
+    for (i = 0; i < (spec->subgraph_count > 0 ? spec->subgraph_count : 1); ++i)
+        fb_vector_entry(&b, subgraphs, (size_t)i, subgraph_table(&b, spec));
+    fb_field_offset(&b, model, 2, subgraphs);
+    present_model[1] = present_model[2] = 1;
+    fb_table_end(&b, model, 8, present_model);
+    fb_u32(&b, root, (uint32_t)model);
+    if (b.bad)
         return 0;
-    memcpy(out, model_bytes, model.n);
-    return model.n;
+    while (b.len < 1200 && b.len < cap)
+        out[b.len++] = 0;
+    return b.len;
 }
 
 /* ---- filesystem helpers ---- */
@@ -202,15 +252,67 @@ static void path_in(char *out, size_t size, const char *dir, const char *name)
     snprintf(out, size, "%s/%s", dir, name);
 }
 
-static const struct model_spec classifier_good = {
-    "onnx::Flatten_0", "13", {"Flatten", "Gemm", "Relu", "Sigmoid"}, 4, 13, 0, 1100};
+/* ---- manifest ---- */
 
-static const struct model_spec feature_mel = {"input", "output", {"Mel"}, 1, 13, 0, 1100};
-static const struct model_spec feature_embedding = {
-    "input_1", "conv2d_19", {"Conv"}, 1, 13, 0, 1100};
+enum {
+    MF_BAD_TYPE = 1u << 0,
+    MF_BAD_VERSION = 1u << 1,
+    MF_NO_WORD = 1u << 2,
+    MF_BAD_MODEL = 1u << 3,
+    MF_NO_MICRO = 1u << 4,
+    MF_BAD_CUTOFF = 1u << 5,
+    MF_BAD_WINDOW = 1u << 6,
+    MF_BAD_STEP = 1u << 7,
+    MF_BAD_ARENA = 1u << 8,
+    MF_HUGE_ARENA = 1u << 9,
+};
+
+static void manifest_text(char *out, size_t size, const char *name, const char *word,
+                          unsigned flags)
+{
+    char model_name[96], model_field[128];
+    char word_field[96] = "";
+    char micro_field[192] = "";
+    const char *type = (flags & MF_BAD_TYPE) ? "legacy" : "micro";
+    int version = (flags & MF_BAD_VERSION) ? 1 : 2;
+
+    snprintf(model_name, sizeof(model_name), "%s.tflite",
+             (flags & MF_BAD_MODEL) ? "other" : name);
+    snprintf(model_field, sizeof(model_field), "\"model\":\"%s\"", model_name);
+    if (!(flags & MF_NO_WORD))
+        snprintf(word_field, sizeof(word_field), "\"wake_word\":\"%s\",", word ? word : name);
+    if (!(flags & MF_NO_MICRO)) {
+        int window = (flags & MF_BAD_WINDOW) ? 0 : 5;
+        int step = (flags & MF_BAD_STEP) ? 0 : 10;
+        int arena = (flags & MF_BAD_ARENA) ? 0 : ((flags & MF_HUGE_ARENA) ? 100000 : 26080);
+        double cutoff = (flags & MF_BAD_CUTOFF) ? 1.5 : 0.97;
+        snprintf(micro_field, sizeof(micro_field),
+                 ",\"micro\":{\"probability_cutoff\":%.2f,\"sliding_window_size\":%d,"
+                 "\"feature_step_size\":%d,\"tensor_arena_size\":%d}",
+                 cutoff, window, step, arena);
+    }
+    snprintf(out, size,
+             "{\"type\":\"%s\",\"version\":%d,%s%s%s}",
+             type, version, word_field, model_field, micro_field);
+}
+
+static void write_manifest(const char *dir, const char *name, const char *word,
+                           unsigned flags)
+{
+    char path[700], text[512], file[96];
+
+    manifest_text(text, sizeof(text), name, word, flags);
+    snprintf(file, sizeof(file), "%s.json", name);
+    path_in(path, sizeof(path), dir, file);
+    write_file(path, (const unsigned char *)text, strlen(text));
+}
+
+/* ---- checks ---- */
 
 static void check_names(void)
 {
+    char file[80];
+
     CHECK(le_wake_model_name_valid("my-word"));
     CHECK(le_wake_model_name_valid("Hey_Kitchen.2"));
     CHECK(!le_wake_model_name_valid(""));
@@ -218,22 +320,57 @@ static void check_names(void)
     CHECK(!le_wake_model_name_valid("../escape"));
     CHECK(!le_wake_model_name_valid("with space"));
     CHECK(!le_wake_model_name_valid("slash/name"));
-    CHECK(!le_wake_model_name_valid("quote\""));
     CHECK(!le_wake_model_name_valid(NULL));
+
+    CHECK(le_wake_model_file_name("my-word", 0, file, sizeof(file)) == 0);
+    CHECK(!strcmp(file, "my-word.json"));
+    CHECK(le_wake_model_file_name("my-word", 1, file, sizeof(file)) == 0);
+    CHECK(!strcmp(file, "my-word.tflite"));
+    CHECK(le_wake_model_file_name("my-word", 2, file, sizeof(file)) < 0);
+    CHECK(le_wake_model_file_known("my-word", "my-word.json"));
+    CHECK(le_wake_model_file_known("my-word", "my-word.tflite"));
+    CHECK(!le_wake_model_file_known("my-word", "other.json"));
+    CHECK(!le_wake_model_file_known("my-word", "my-word.bin"));
 }
 
 static void check_labels(void)
 {
-    char phrase[64], model[64];
+    char dir[700], phrase[64], model[64];
+    unsigned char bytes[16384];
+    size_t length = build_model(bytes, sizeof(bytes), &good_model);
 
-    CHECK(le_wake_model_label("/usr/share/libreecho/openwakeword", phrase, sizeof(phrase),
-                              model, sizeof(model)) == 0);
-    CHECK(!strcmp(phrase, "Alexa"));
-    CHECK(!strcmp(model, "alexa_v0.1"));
-    CHECK(le_wake_model_label("/data/libreecho/wakeword-models/my-word/", phrase,
+    CHECK(length > 0);
+    CHECK(le_wake_model_label("/usr/share/libreecho/wakeword/alexa", phrase,
                               sizeof(phrase), model, sizeof(model)) == 0);
-    CHECK(!strcmp(phrase, "my-word"));
-    CHECK(!strcmp(model, "my-word"));
+    CHECK(!strcmp(phrase, "Alexa"));
+    CHECK(!strcmp(model, "alexa"));
+
+    make_root();
+    path_in(dir, sizeof(dir), root, "owner-word");
+    mkdir(dir, 0700);
+    {
+        char model_path[720];
+        path_in(model_path, sizeof(model_path), dir, "owner-word.tflite");
+        write_file(model_path, bytes, length);
+    }
+    write_manifest(dir, "owner-word", "Hey Kitchen", 0);
+    CHECK(le_wake_model_label(dir, phrase, sizeof(phrase), model, sizeof(model)) == 0);
+    CHECK(!strcmp(phrase, "Hey Kitchen"));
+    CHECK(!strcmp(model, "owner-word"));
+
+    /* A manifest with a broken model field is ignored for the phrase. */
+    path_in(dir, sizeof(dir), root, "two-words");
+    mkdir(dir, 0700);
+    write_manifest(dir, "two-words", "Two Words", MF_BAD_MODEL);
+    CHECK(le_wake_model_label(dir, phrase, sizeof(phrase), model, sizeof(model)) == 0);
+    CHECK(!strcmp(phrase, "Two Words"));
+    CHECK(!strcmp(model, "two-words"));
+
+    /* Without any manifest the phrase comes from the folder name. */
+    path_in(dir, sizeof(dir), root, "hey_kitchen");
+    mkdir(dir, 0700);
+    CHECK(le_wake_model_phrase_for(dir, phrase, sizeof(phrase)) == 0);
+    CHECK(!strcmp(phrase, "Hey Kitchen"));
     CHECK(le_wake_model_label("/data/libreecho/wakeword-models/bad name", phrase,
                               sizeof(phrase), model, sizeof(model)) < 0);
 }
@@ -247,98 +384,131 @@ static void check_contract(void)
     make_root();
     path_in(dir, sizeof(dir), root, "contract");
     mkdir(dir, 0700);
+    path_in(path, sizeof(path), dir, "my-word.tflite");
 
-    path_in(path, sizeof(path), dir, "alexa_v0.1.onnx");
-    length = build_model(bytes, sizeof(bytes), &classifier_good);
+    length = build_model(bytes, sizeof(bytes), &good_model);
+    CHECK(length >= LE_WAKE_MODEL_MIN_BYTES);
     write_file(path, bytes, length);
-    CHECK(le_wake_model_validate_file(path, "alexa_v0.1.onnx", reason, sizeof(reason)) == 0);
+    CHECK(le_wake_model_validate_file(path, "my-word.tflite", reason, sizeof(reason)) == 0);
 
     {
-        struct model_spec s = classifier_good;
-        s.output = "14";
+        struct model_spec s = good_model;
+        s.builtin = 5; /* not in the resolver's operator set */
         length = build_model(bytes, sizeof(bytes), &s);
         write_file(path, bytes, length);
-        CHECK(le_wake_model_validate_file(path, "alexa_v0.1.onnx", reason, sizeof(reason)) < 0);
-    }
-    {
-        struct model_spec s = classifier_good;
-        s.input = "input";
-        length = build_model(bytes, sizeof(bytes), &s);
-        write_file(path, bytes, length);
-        CHECK(le_wake_model_validate_file(path, "alexa_v0.1.onnx", reason, sizeof(reason)) < 0);
-    }
-    {
-        struct model_spec s = classifier_good;
-        s.ops[1] = "Conv";
-        length = build_model(bytes, sizeof(bytes), &s);
-        write_file(path, bytes, length);
-        CHECK(le_wake_model_validate_file(path, "alexa_v0.1.onnx", reason, sizeof(reason)) < 0);
+        CHECK(le_wake_model_validate_file(path, "my-word.tflite", reason, sizeof(reason)) < 0);
         CHECK(strstr(reason, "operators") != NULL);
     }
     {
-        struct model_spec s = classifier_good;
-        s.ops[3] = "Relu";
+        struct model_spec s = good_model;
+        s.input_type = 3; /* uint8 input */
         length = build_model(bytes, sizeof(bytes), &s);
         write_file(path, bytes, length);
-        CHECK(le_wake_model_validate_file(path, "alexa_v0.1.onnx", reason, sizeof(reason)) < 0);
-        CHECK(strstr(reason, "Sigmoid") != NULL);
+        CHECK(le_wake_model_validate_file(path, "my-word.tflite", reason, sizeof(reason)) < 0);
+        CHECK(strstr(reason, "int8") != NULL);
     }
     {
-        struct model_spec s = classifier_good;
-        s.opset = 17;
+        struct model_spec s = good_model;
+        s.input_dims[1] = 0;
         length = build_model(bytes, sizeof(bytes), &s);
         write_file(path, bytes, length);
-        CHECK(le_wake_model_validate_file(path, "alexa_v0.1.onnx", reason, sizeof(reason)) < 0);
+        CHECK(le_wake_model_validate_file(path, "my-word.tflite", reason, sizeof(reason)) < 0);
     }
     {
-        struct model_spec s = classifier_good;
-        s.external = 1;
+        struct model_spec s = good_model;
+        s.input_dims[2] = 41;
         length = build_model(bytes, sizeof(bytes), &s);
         write_file(path, bytes, length);
-        CHECK(le_wake_model_validate_file(path, "alexa_v0.1.onnx", reason, sizeof(reason)) < 0);
-        CHECK(strstr(reason, "external") != NULL);
+        CHECK(le_wake_model_validate_file(path, "my-word.tflite", reason, sizeof(reason)) < 0);
     }
     {
-        struct model_spec s = classifier_good;
-        s.pad = 0;
+        struct model_spec s = good_model;
+        s.output_type = 9; /* int8 output */
         length = build_model(bytes, sizeof(bytes), &s);
         write_file(path, bytes, length);
-        CHECK(le_wake_model_validate_file(path, "alexa_v0.1.onnx", reason, sizeof(reason)) < 0);
-        CHECK(strstr(reason, "size") != NULL);
+        CHECK(le_wake_model_validate_file(path, "my-word.tflite", reason, sizeof(reason)) < 0);
+        CHECK(strstr(reason, "uint8") != NULL);
+    }
+    {
+        struct model_spec s = good_model;
+        s.output_dims[1] = 2;
+        length = build_model(bytes, sizeof(bytes), &s);
+        write_file(path, bytes, length);
+        CHECK(le_wake_model_validate_file(path, "my-word.tflite", reason, sizeof(reason)) < 0);
+    }
+    {
+        struct model_spec s = good_model;
+        s.subgraph_count = 2;
+        length = build_model(bytes, sizeof(bytes), &s);
+        write_file(path, bytes, length);
+        CHECK(le_wake_model_validate_file(path, "my-word.tflite", reason, sizeof(reason)) < 0);
+        CHECK(strstr(reason, "one subgraph") != NULL);
+    }
+    {
+        struct model_spec s = good_model;
+        s.opcode_index = 1;
+        length = build_model(bytes, sizeof(bytes), &s);
+        write_file(path, bytes, length);
+        CHECK(le_wake_model_validate_file(path, "my-word.tflite", reason, sizeof(reason)) < 0);
+        CHECK(strstr(reason, "opcode") != NULL);
+    }
+    {
+        /* An all-zero file has no usable root table. */
+        memset(bytes, 0, 1200);
+        write_file(path, bytes, 1200);
+        CHECK(le_wake_model_validate_file(path, "my-word.tflite", reason, sizeof(reason)) < 0);
+        CHECK(strstr(reason, "flatbuffer") != NULL);
     }
     {
         /* A symlink to a good model is refused, not followed. */
         char link_path[700];
-        path_in(link_path, sizeof(link_path), dir, "link.onnx");
-        length = build_model(bytes, sizeof(bytes), &classifier_good);
+        length = build_model(bytes, sizeof(bytes), &good_model);
         write_file(path, bytes, length);
+        path_in(link_path, sizeof(link_path), dir, "link.tflite");
         symlink(path, link_path);
-        CHECK(le_wake_model_validate_file(link_path, "alexa_v0.1.onnx", reason,
+        CHECK(le_wake_model_validate_file(link_path, "link.tflite", reason,
                                           sizeof(reason)) < 0);
         unlink(link_path);
     }
-    CHECK(le_wake_model_validate_file(path, "unknown.onnx", reason, sizeof(reason)) < 0);
-    CHECK(le_wake_model_validate_file(path, "alexa_v0.1.onnx", NULL, 0) == 0);
+    length = build_model(bytes, sizeof(bytes), &good_model);
+    write_file(path, bytes, length);
+    CHECK(le_wake_model_validate_file(path, "unknown.bin", reason, sizeof(reason)) < 0);
+    CHECK(le_wake_model_validate_file(path, "my-word.tflite", NULL, 0) == 0);
+
+    /* Manifest contract. */
+    path_in(path, sizeof(path), dir, "my-word.json");
+    {
+        char text[512];
+        manifest_text(text, sizeof(text), "my-word", "My Word", 0);
+        write_file(path, (const unsigned char *)text, strlen(text));
+    }
+    CHECK(le_wake_model_validate_file(path, "my-word.json", reason, sizeof(reason)) == 0);
+
+    {
+        const unsigned flags[] = {MF_BAD_TYPE, MF_BAD_VERSION, MF_NO_WORD, MF_BAD_MODEL,
+                                  MF_NO_MICRO, MF_BAD_CUTOFF, MF_BAD_WINDOW, MF_BAD_STEP,
+                                  MF_BAD_ARENA, MF_HUGE_ARENA};
+        size_t i;
+        for (i = 0; i < sizeof(flags) / sizeof(flags[0]); ++i) {
+            char text[512];
+            manifest_text(text, sizeof(text), "my-word", "My Word", flags[i]);
+            write_file(path, (const unsigned char *)text, strlen(text));
+            CHECK(le_wake_model_validate_file(path, "my-word.json", reason,
+                                              sizeof(reason)) < 0);
+        }
+    }
 }
 
-static void write_set(const char *dir, int bad_mel)
+static void write_set(const char *dir, const char *name, unsigned manifest_flags)
 {
     unsigned char bytes[16384];
-    char path[700];
-    size_t length;
-    struct model_spec mel = feature_mel;
+    char path[700], file[96];
+    size_t length = build_model(bytes, sizeof(bytes), &good_model);
 
-    path_in(path, sizeof(path), dir, "melspectrogram.onnx");
-    if (bad_mel)
-        mel.input = "wrong";
-    length = build_model(bytes, sizeof(bytes), &mel);
+    snprintf(file, sizeof(file), "%s.tflite", name);
+    path_in(path, sizeof(path), dir, file);
     write_file(path, bytes, length);
-    path_in(path, sizeof(path), dir, "embedding_model.onnx");
-    length = build_model(bytes, sizeof(bytes), &feature_embedding);
-    write_file(path, bytes, length);
-    path_in(path, sizeof(path), dir, "alexa_v0.1.onnx");
-    length = build_model(bytes, sizeof(bytes), &classifier_good);
-    write_file(path, bytes, length);
+    write_manifest(dir, name, name, manifest_flags);
 }
 
 static void check_directory(void)
@@ -346,9 +516,9 @@ static void check_directory(void)
     char dir[600], extra[700], reason[200];
 
     make_root();
-    path_in(dir, sizeof(dir), root, "folder");
+    path_in(dir, sizeof(dir), root, "hey_kitchen");
     mkdir(dir, 0700);
-    write_set(dir, 0);
+    write_set(dir, "hey_kitchen", 0);
     CHECK(le_wake_model_validate_directory(dir, reason, sizeof(reason)) == 0);
 
     path_in(extra, sizeof(extra), dir, "notes.txt");
@@ -356,9 +526,18 @@ static void check_directory(void)
     CHECK(le_wake_model_validate_directory(dir, reason, sizeof(reason)) < 0);
     unlink(extra);
 
-    write_set(dir, 1);
+    path_in(extra, sizeof(extra), dir, "hey_kitchen.tflite");
+    unlink(extra);
     CHECK(le_wake_model_validate_directory(dir, reason, sizeof(reason)) < 0);
-    CHECK(strstr(reason, "melspectrogram") != NULL);
+    CHECK(strstr(reason, "exactly") != NULL);
+
+    /* A folder holding an unsupported model file is rejected. */
+    path_in(dir, sizeof(dir), root, "old_word");
+    mkdir(dir, 0700);
+    path_in(extra, sizeof(extra), dir, "old_word.bin");
+    write_file(extra, (const unsigned char *)"x", 1);
+    CHECK(le_wake_model_validate_directory(dir, reason, sizeof(reason)) < 0);
+    CHECK(strstr(reason, "unexpected file") != NULL);
 }
 
 /* ---- store ---- */
@@ -367,6 +546,7 @@ struct tally {
     int count;
     int valid;
     int selected;
+    unsigned long bytes;
 };
 
 static void tally_visit(const struct le_wake_model_entry *entry, void *opaque)
@@ -377,6 +557,7 @@ static void tally_visit(const struct le_wake_model_entry *entry, void *opaque)
         ++t->valid;
     if (entry->selected)
         ++t->selected;
+    t->bytes += entry->bytes;
 }
 
 static void stage_file(const struct le_wake_model_paths *paths, const char *name,
@@ -400,6 +581,9 @@ static void stage_file(const struct le_wake_model_paths *paths, const char *name
         size_t piece = n - offset > 700 ? 700 : n - offset;
         int rc = le_wake_model_stage_chunk(paths, name, file, (unsigned long)offset,
                                            bytes + offset, piece, &staged);
+        if (rc != LE_WAKE_MODEL_STORE_OK)
+            fprintf(stderr, "stage %s/%s rc=%d offset=%lu\n", name, file, rc,
+                    (unsigned long)offset);
         CHECK(rc == LE_WAKE_MODEL_STORE_OK);
         offset += piece;
     }
@@ -424,39 +608,35 @@ static void check_store(void)
     CHECK(strstr(paths.selection, "/config/wake-model") != NULL);
 
     /* Rejected names and files never touch the store. */
-    CHECK(le_wake_model_stage_chunk(&paths, "../evil", "alexa_v0.1.onnx", 0, chunk, 1,
+    CHECK(le_wake_model_stage_chunk(&paths, "../evil", "evil.json", 0, chunk, 1,
                                     &staged) == LE_WAKE_MODEL_STORE_INVALID);
     CHECK(le_wake_model_stage_chunk(&paths, "my-word", "other.bin", 0, chunk, 1,
                                     &staged) == LE_WAKE_MODEL_STORE_INVALID);
-    CHECK(le_wake_model_stage_chunk(&paths, LE_WAKE_MODEL_STOCK_NAME, "alexa_v0.1.onnx", 0,
+    CHECK(le_wake_model_stage_chunk(&paths, LE_WAKE_MODEL_STOCK_NAME, "alexa.json", 0,
                                     chunk, 1, &staged) == LE_WAKE_MODEL_STORE_INVALID);
-    CHECK(le_wake_model_stage_chunk(&paths, "my-word", "alexa_v0.1.onnx", 0, chunk,
+    CHECK(le_wake_model_stage_chunk(&paths, "vad", "vad.json", 0, chunk, 1,
+                                    &staged) == LE_WAKE_MODEL_STORE_INVALID);
+    CHECK(le_wake_model_stage_chunk(&paths, "my-word", "my-word.json", 0, chunk,
                                     LE_WAKE_MODEL_STAGE_CHUNK_MAX + 1,
                                     &staged) == LE_WAKE_MODEL_STORE_INVALID);
 
     /* Offsets must follow on from what is staged. */
     path_in(source, sizeof(source), root, "source");
     mkdir(source, 0700);
-    write_set(source, 0);
-    stage_file(&paths, "my-word", "melspectrogram.onnx", source);
-    stage_file(&paths, "my-word", "embedding_model.onnx", source);
-    stage_file(&paths, "my-word", "alexa_v0.1.onnx", source);
-    CHECK(le_wake_model_stage_chunk(&paths, "my-word", "alexa_v0.1.onnx", 3, chunk, 2,
+    write_set(source, "my-word", 0);
+    stage_file(&paths, "my-word", "my-word.json", source);
+    stage_file(&paths, "my-word", "my-word.tflite", source);
+    CHECK(le_wake_model_stage_chunk(&paths, "my-word", "my-word.tflite", 3, chunk, 2,
                                     &staged) == LE_WAKE_MODEL_STORE_INVALID);
 
     /* Committing a folder that does not pass is refused and cleaned up. */
     {
-        unsigned char bytes[16384];
-        struct model_spec bad = classifier_good;
-        size_t length;
-        bad.output = "wrong";
-        length = build_model(bytes, sizeof(bytes), &bad);
-        stage_file(&paths, "bad-word", "melspectrogram.onnx", source);
-        stage_file(&paths, "bad-word", "embedding_model.onnx", source);
-        CHECK(le_wake_model_stage_chunk(&paths, "bad-word", "alexa_v0.1.onnx", 0, bytes,
-                                        length, &staged) == LE_WAKE_MODEL_STORE_OK);
+        write_set(source, "bad-word", MF_BAD_CUTOFF);
+        stage_file(&paths, "bad-word", "bad-word.json", source);
+        stage_file(&paths, "bad-word", "bad-word.tflite", source);
         rc = le_wake_model_commit(&paths, "bad-word", reason, sizeof(reason));
         CHECK(rc == LE_WAKE_MODEL_STORE_INVALID);
+        CHECK(strstr(reason, "probability_cutoff") != NULL);
         CHECK(le_wake_model_commit(&paths, "bad-word", reason, sizeof(reason)) ==
               LE_WAKE_MODEL_STORE_NOT_FOUND);
     }
@@ -468,7 +648,7 @@ static void check_store(void)
 
     memset(&t, 0, sizeof(t));
     CHECK(le_wake_model_scan(&paths, tally_visit, &t) == 1);
-    CHECK(t.count == 1 && t.valid == 1 && t.selected == 0);
+    CHECK(t.count == 1 && t.valid == 1 && t.selected == 0 && t.bytes > 1200);
 
     /* Selection: stock by default, the folder once selected, stock again after. */
     CHECK(le_wake_model_selection_read(&paths, name, sizeof(name)) == 0);

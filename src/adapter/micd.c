@@ -506,7 +506,7 @@ static int apply_mixer_setting(const char *mixer_bin,
  * Post-mixdown digital gain for the calibrated mono stream.
  *
  * The analogue PGA cannot reach the level the wake model needs.  Scoring
- * the device's own capture through the openwakeword alexa_v0.1 model, the
+ * the device's own capture through the reference wake model, the
  * stream peaks at 0.41 against a 0.45 accept gate with one supporting
  * frame where two are required -- a near miss on every attempt.  The same
  * audio amplified scores 0.70 at three times and 0.80 at six, both of
@@ -614,7 +614,7 @@ static void apply_digital_gain(int16_t *samples, size_t count,
  * stream saturated regardless of any gain.
  *
  * The top of the range matters.  Scoring real captured audio through the
- * openwakeword alexa model, the device's own stream peaked at 0.41 against
+ * reference wake model, the device's own stream peaked at 0.41 against
  * a 0.45 gate with a single supporting frame -- a near miss on every
  * attempt.  The same audio amplified three times scores 0.70 with two
  * supporting frames and would fire, and six times scores 0.80.  The word

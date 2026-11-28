@@ -84,7 +84,7 @@ endif
 ESPHOMED_SOURCES = src/adapter/esphomed.c src/adapter/esphome_proto.c src/adapter/esphome_ble_proxy.c \
 	src/adapter/esphome_frame.c src/adapter/esphome_noise.c src/adapter/esphome_playback.c \
 	src/adapter/radio_resample.c src/adapter/mdns_client.c src/adapter/mdns_lease.c \
-	src/adapter/voice_ns.c src/config_store.c src/json.c
+	src/adapter/voice_ns.c src/config_store.c src/json.c src/wake_model.c src/wake_model_store.c src/service_env.c
 ESPHOMED_TEST_TLS_PREFIX ?= $(ESPHOMED_TLS_PREFIX)
 ESPHOMED_CRYPTO_PYTHON ?= python3
 ESPHOMED_AIO_PYTHON ?= python3
@@ -592,7 +592,7 @@ $(BUILD)/test-service-cancel-linux: tests/test_service_cancel_linux.c \
 	$(CC) -D_POSIX_C_SOURCE=200809L $(CSTD) $(WARN) -Werror -Isrc $^ -o $@
 
 # Drives the real worker, queue, thread and decoder against scripted score
-# sequences; the test supplies its own le_wake_engine, so no ONNX runtime or
+# sequences; the test supplies its own le_wake_engine, so no engine library or
 # model is needed to exercise the decoding rules.
 $(BUILD)/test-voice-clip-store: tests/test_voice_clip_store.c \
 	src/adapter/voice_clip_store.c
@@ -601,7 +601,7 @@ $(BUILD)/test-voice-clip-store: tests/test_voice_clip_store.c \
 		$^ -o $@
 
 $(BUILD)/test-wake-decode: tests/test_wake_decode.c \
-	src/adapter/wake_worker.c src/wake_model.c
+	src/adapter/wake_worker.c src/wake_model.c src/json.c
 	@mkdir -p $(BUILD)
 	$(CC) -D_POSIX_C_SOURCE=200809L $(CSTD) $(WARN) -Werror -Isrc -Isrc/adapter \
 		$^ -lpthread -lm -o $@
@@ -911,30 +911,15 @@ ESPEAK_SRC ?=
 FLITE_SRC ?=
 SPEEX_PREFIX ?=
 ARM_SPEEX_PREFIX ?=
-WAKE_ORT_BUILD ?= $(ORT_BUILD)
-WAKE_ORT_SOURCE ?=
+# Ticket 01's build_micro_wake_word.sh exports these three paths.  The same
+# variables carry the host archives for test-wake-engine-mww.
+WAKE_TFLM_INCLUDE ?=
+WAKE_TFLM_LIB ?=
+WAKE_TFLM_FRONTEND_LIB ?=
 WAKE_ARM_CXXFLAGS = -march=armv7-a -mfpu=neon-vfpv4 \
 	-mfloat-abi=hard -std=c++17 -O3 -ffunction-sections \
 	-fdata-sections -Wall -Wextra -Wpedantic -Werror \
-	-Isrc -Isrc/adapter -I$(WAKE_ORT_SOURCE)/include
-WAKE_ORT_ARCHIVES = \
-	$(WAKE_ORT_BUILD)/libonnxruntime_session.a \
-	$(WAKE_ORT_BUILD)/libonnxruntime_optimizer.a \
-	$(WAKE_ORT_BUILD)/libonnxruntime_providers.a \
-	$(WAKE_ORT_BUILD)/libonnxruntime_graph.a \
-	$(WAKE_ORT_BUILD)/libonnxruntime_framework.a \
-	$(WAKE_ORT_BUILD)/libonnxruntime_common.a \
-	$(WAKE_ORT_BUILD)/libonnxruntime_mlas.a \
-	$(WAKE_ORT_BUILD)/libonnxruntime_util.a \
-	$(WAKE_ORT_BUILD)/libonnxruntime_flatbuffers.a \
-	$(WAKE_ORT_BUILD)/libonnxruntime_lora.a \
-	$(WAKE_ORT_BUILD)/_deps/onnx-build/libonnx.a \
-	$(WAKE_ORT_BUILD)/_deps/onnx-build/libonnx_proto.a \
-	$(WAKE_ORT_BUILD)/_deps/protobuf-build/libprotobuf-lite.a \
-	$(WAKE_ORT_BUILD)/_deps/flatbuffers-build/libflatbuffers.a \
-	$(RE2_ARCHIVE)
-WAKE_ORT_ABSEIL = $$(find $(WAKE_ORT_BUILD)/_deps/abseil_cpp-build \
-	-name '*.a')
+	-Isrc -Isrc/adapter
 ORT_ARCHIVES = \
 	$(ORT_BUILD)/libonnxruntime_session.a \
 	$(ORT_BUILD)/libonnxruntime_optimizer.a \
@@ -1297,21 +1282,36 @@ $(BUILD)/libreecho-waked-arm32: src/adapter/waked.c src/adapter/voice_aec.c \
 		$(filter %.c,$^) $(ARM_SPEEX_PREFIX)/lib/libspeexdsp.a \
 		-static -Wl,--gc-sections -lm -o $@
 
-$(BUILD)/wake_engine_onnx.arm.o: src/adapter/wake_engine_onnx.cpp
+$(BUILD)/wake_engine_mww.arm.o: src/adapter/wake_engine_mww.cpp
 	@mkdir -p $(BUILD)
-	$(CROSS_COMPILE)g++ $(WAKE_ARM_CXXFLAGS) -c $< -o $@
+	$(CROSS_COMPILE)g++ $(WAKE_ARM_CXXFLAGS) \
+		$(if $(strip $(WAKE_TFLM_INCLUDE)),-isystem $(WAKE_TFLM_INCLUDE)) \
+		-c $< -o $@
 
-$(BUILD)/test_wake_engine.arm.o: tests/test_wake_engine.cpp
+# Host engine test.  WAKE_TEST_MODELS points at the pinned v2 model directory;
+# the recipe stages the per-word folders the engine expects.
+WAKE_TEST_MODELS ?= ../../inputs/public-deps/micro-wake-word-models-source/models/v2
+$(BUILD)/test-wake-engine-mww: tests/test_wake_engine_mww.cpp \
+		src/adapter/wake_engine_mww.cpp
 	@mkdir -p $(BUILD)
-	$(CROSS_COMPILE)g++ $(WAKE_ARM_CXXFLAGS) -c $< -o $@
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+		-Isrc -Isrc/adapter \
+		$(if $(strip $(WAKE_TFLM_INCLUDE)),-isystem $(WAKE_TFLM_INCLUDE)) \
+		$(filter %.cpp,$^) $(WAKE_TFLM_LIB) $(WAKE_TFLM_FRONTEND_LIB) \
+		-lpthread -lm -o $@
 
-$(BUILD)/test-wake-engine-arm32: $(BUILD)/wake_engine_onnx.arm.o \
-		$(BUILD)/test_wake_engine.arm.o
-	$(CROSS_COMPILE)g++ -march=armv7-a -mfpu=neon-vfpv4 \
-		-mfloat-abi=hard -static -static-libstdc++ -static-libgcc \
-		-Wl,--gc-sections -o $@ $^ -Wl,--start-group \
-		$(WAKE_ORT_ARCHIVES) $(WAKE_ORT_ABSEIL) -Wl,--end-group \
-		-lpthread -ldl -lm
+test-wake-engine-mww: $(BUILD)/test-wake-engine-mww
+	@rm -rf $(BUILD)/mww-models
+	@mkdir -p $(BUILD)/mww-models/alexa $(BUILD)/mww-models/okay_nabu \
+		$(BUILD)/mww-models/vad
+	@cp $(WAKE_TEST_MODELS)/alexa.json $(WAKE_TEST_MODELS)/alexa.tflite \
+		$(BUILD)/mww-models/alexa/
+	@cp $(WAKE_TEST_MODELS)/okay_nabu.json \
+		$(WAKE_TEST_MODELS)/okay_nabu.tflite $(BUILD)/mww-models/okay_nabu/
+	@cp $(WAKE_TEST_MODELS)/vad.json $(WAKE_TEST_MODELS)/vad.tflite \
+		$(BUILD)/mww-models/vad/
+	./$(BUILD)/test-wake-engine-mww $(BUILD)/mww-models \
+		tests tests/fixtures/wake_engine_mww_expected.txt
 
 $(BUILD)/wake-adapter-client-arm32: tests/wake_adapter_client.c \
 		src/adapter/adapter_client.c src/log.c
@@ -1327,92 +1327,100 @@ $(BUILD)/stt-stream-file-client-arm32: tests/stt_stream_file_client.c
 		-ffunction-sections -fdata-sections -Wall -Wextra \
 		-Wpedantic -Werror $< -static -Wl,--gc-sections -o $@
 
-$(BUILD)/%.wake.arm.o: src/adapter/%.c
-	@mkdir -p $(BUILD)
-	$(CROSS_COMPILE)$(CC) -D_POSIX_C_SOURCE=200809L \
-		-DLE_WAKE_ENGINE_ONNX -std=c99 -O3 -march=armv7-a \
-		-mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections \
-		-fdata-sections -Wall -Wextra -Wpedantic -Werror \
-		-Isrc -Isrc/adapter -I$(ARM_SPEEX_PREFIX)/include \
-		-c $< -o $@
+$(BUILD)/wake_engine_mww.arm.o: src/adapter/wake_engine.h
 
-$(BUILD)/waked.wake.arm.o: src/adapter/adapter.h \
+$(BUILD)/waked.mww.arm.o: src/adapter/adapter.h \
 	src/adapter/voice_aec.h src/adapter/voice_aec_guard.h src/adapter/voice_dsp.h \
 	src/adapter/voice_reference.h src/adapter/voice_stream.h \
 	src/adapter/clap_detector.h src/adapter/wake_arbiter.h \
 	src/adapter/smoke_alarm_detector.h \
 	src/adapter/wake_led.h \
 	src/adapter/wake_worker.h src/json.h
-$(BUILD)/wake_arbiter.wake.arm.o: src/adapter/wake_arbiter.h src/peer_auth.h
-$(BUILD)/voice_aec.wake.arm.o: src/adapter/voice_aec.h
-$(BUILD)/voice_aec_guard.wake.arm.o: src/adapter/voice_aec_guard.h \
+$(BUILD)/wake_arbiter.mww.arm.o: src/adapter/wake_arbiter.h src/peer_auth.h
+$(BUILD)/voice_aec.mww.arm.o: src/adapter/voice_aec.h
+$(BUILD)/voice_aec_guard.mww.arm.o: src/adapter/voice_aec_guard.h \
 	src/adapter/voice_aec.h src/adapter/voice_reference.h
-$(BUILD)/clap_detector.wake.arm.o: src/adapter/clap_detector.h
-$(BUILD)/smoke_alarm_detector.wake.arm.o: src/adapter/smoke_alarm_detector.h
-$(BUILD)/voice_reference.wake.arm.o: src/adapter/voice_reference.h
-$(BUILD)/voice_dsp.wake.arm.o: src/adapter/voice_dsp.h
-$(BUILD)/wake_worker.wake.arm.o: src/adapter/wake_worker.h \
+$(BUILD)/clap_detector.mww.arm.o: src/adapter/clap_detector.h
+$(BUILD)/smoke_alarm_detector.mww.arm.o: src/adapter/smoke_alarm_detector.h
+$(BUILD)/voice_reference.mww.arm.o: src/adapter/voice_reference.h
+$(BUILD)/voice_dsp.mww.arm.o: src/adapter/voice_dsp.h
+$(BUILD)/wake_worker.mww.arm.o: src/adapter/wake_worker.h \
 	src/adapter/wake_engine.h
-$(BUILD)/wake_engine_onnx.arm.o: src/adapter/wake_engine.h
 
-$(BUILD)/log.wake.arm.o: src/log.c
+# The microWakeWord daemon compiles the shared sources with
+# LE_WAKE_ENGINE_MWW, which is what makes waked.c select the microWakeWord
+# engine and its status banner.
+$(BUILD)/%.mww.arm.o: src/adapter/%.c
 	@mkdir -p $(BUILD)
 	$(CROSS_COMPILE)$(CC) -D_POSIX_C_SOURCE=200809L \
-		-DLE_WAKE_ENGINE_ONNX -std=c99 -O3 -march=armv7-a \
+		-DLE_WAKE_ENGINE_MWW \
+		-std=c99 -O3 -march=armv7-a \
 		-mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections \
 		-fdata-sections -Wall -Wextra -Wpedantic -Werror \
-		-Isrc -Isrc/adapter -c $< -o $@
+		-Isrc -Isrc/adapter -I$(ARM_SPEEX_PREFIX)/include \
+		-c $< -o $@
 
-$(BUILD)/wake_model.wake.arm.o: src/wake_model.c src/wake_model.h
-	@mkdir -p $(BUILD)
-	$(CROSS_COMPILE)$(CC) -D_POSIX_C_SOURCE=200809L -std=c99 -O3 -march=armv7-a \
-		-mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections \
-		-fdata-sections -Wall -Wextra -Wpedantic -Werror \
-		-Isrc -Isrc/adapter -c $< -o $@
-
-$(BUILD)/peer_auth.wake.arm.o: src/peer_auth.c src/peer_auth.h src/le_sha256.h
+$(BUILD)/log.mww.arm.o: src/log.c
 	@mkdir -p $(BUILD)
 	$(CROSS_COMPILE)$(CC) -D_POSIX_C_SOURCE=200809L \
-		-DLE_WAKE_ENGINE_ONNX -std=c99 -O3 -march=armv7-a \
+		-std=c99 -O3 -march=armv7-a \
 		-mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections \
 		-fdata-sections -Wall -Wextra -Wpedantic -Werror \
 		-Isrc -Isrc/adapter -c $< -o $@
 
-$(BUILD)/json.wake.arm.o: src/json.c src/json.h
+$(BUILD)/json.mww.arm.o: src/json.c src/json.h
 	@mkdir -p $(BUILD)
 	$(CROSS_COMPILE)$(CC) -D_POSIX_C_SOURCE=200809L \
-		-DLE_WAKE_ENGINE_ONNX -std=c99 -O3 -march=armv7-a \
+		-std=c99 -O3 -march=armv7-a \
 		-mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections \
 		-fdata-sections -Wall -Wextra -Wpedantic -Werror \
 		-Isrc -Isrc/adapter -c $< -o $@
 
-WAKE_DAEMON_ARM_OBJECTS = $(BUILD)/waked.wake.arm.o \
-	$(BUILD)/clap_detector.wake.arm.o \
-	$(BUILD)/smoke_alarm_detector.wake.arm.o \
-	$(BUILD)/voice_aec.wake.arm.o \
-	$(BUILD)/voice_aec_guard.wake.arm.o \
-	$(BUILD)/voice_reference.wake.arm.o \
-	$(BUILD)/voice_dsp.wake.arm.o \
-	$(BUILD)/voice_stream.wake.arm.o \
-	$(BUILD)/wake_worker.wake.arm.o \
-	$(BUILD)/wake_led.wake.arm.o \
-	$(BUILD)/wake_arbiter.wake.arm.o \
-	$(BUILD)/peer_auth.wake.arm.o \
-	$(BUILD)/voice_clip_store.wake.arm.o \
-	$(BUILD)/adapter_client.wake.arm.o \
-	$(BUILD)/adapter_server.wake.arm.o \
-	$(BUILD)/log.wake.arm.o \
-	$(BUILD)/json.wake.arm.o \
-	$(BUILD)/wake_model.wake.arm.o \
-	$(BUILD)/wake_engine_onnx.arm.o
+$(BUILD)/wake_model.mww.arm.o: src/wake_model.c src/wake_model.h
+	@mkdir -p $(BUILD)
+	$(CROSS_COMPILE)$(CC) -D_POSIX_C_SOURCE=200809L \
+		-std=c99 -O3 -march=armv7-a \
+		-mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections \
+		-fdata-sections -Wall -Wextra -Wpedantic -Werror \
+		-Isrc -Isrc/adapter -c $< -o $@
 
-$(BUILD)/libreecho-waked-onnx-arm32: $(WAKE_DAEMON_ARM_OBJECTS)
+$(BUILD)/peer_auth.mww.arm.o: src/peer_auth.c src/peer_auth.h src/le_sha256.h
+	@mkdir -p $(BUILD)
+	$(CROSS_COMPILE)$(CC) -D_POSIX_C_SOURCE=200809L \
+		-std=c99 -O3 -march=armv7-a \
+		-mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections \
+		-fdata-sections -Wall -Wextra -Wpedantic -Werror \
+		-Isrc -Isrc/adapter -c $< -o $@
+
+# The microWakeWord daemon, linked against the engine and ticket 01's TFLM
+# archives.
+WAKE_DAEMON_MWW_ARM_OBJECTS = $(BUILD)/waked.mww.arm.o \
+	$(BUILD)/clap_detector.mww.arm.o \
+	$(BUILD)/smoke_alarm_detector.mww.arm.o \
+	$(BUILD)/voice_aec.mww.arm.o \
+	$(BUILD)/voice_aec_guard.mww.arm.o \
+	$(BUILD)/voice_reference.mww.arm.o \
+	$(BUILD)/voice_dsp.mww.arm.o \
+	$(BUILD)/voice_stream.mww.arm.o \
+	$(BUILD)/wake_worker.mww.arm.o \
+	$(BUILD)/wake_led.mww.arm.o \
+	$(BUILD)/wake_arbiter.mww.arm.o \
+	$(BUILD)/peer_auth.mww.arm.o \
+	$(BUILD)/voice_clip_store.mww.arm.o \
+	$(BUILD)/adapter_client.mww.arm.o \
+	$(BUILD)/adapter_server.mww.arm.o \
+	$(BUILD)/log.mww.arm.o \
+	$(BUILD)/json.mww.arm.o \
+	$(BUILD)/wake_model.mww.arm.o \
+	$(BUILD)/wake_engine_mww.arm.o
+
+$(BUILD)/libreecho-waked-mww-arm32: $(WAKE_DAEMON_MWW_ARM_OBJECTS)
 	$(CROSS_COMPILE)g++ -march=armv7-a -mfpu=neon-vfpv4 \
 		-mfloat-abi=hard -static -static-libstdc++ -static-libgcc \
 		-Wl,--gc-sections -o $@ $^ \
 		$(ARM_SPEEX_PREFIX)/lib/libspeexdsp.a \
-		-Wl,--start-group $(WAKE_ORT_ARCHIVES) \
-		$(WAKE_ORT_ABSEIL) -Wl,--end-group -lpthread -ldl -lm
+		-Wl,--start-group $(WAKE_TFLM_LIB) $(WAKE_TFLM_FRONTEND_LIB) \
+		-Wl,--end-group -lpthread -ldl -lm
 
 adapters: $(ADAPTER_TARGETS)
 
@@ -1502,7 +1510,7 @@ clean:
 		$(ADAPTER_TARGETS) \
 		$(TARGET) $(LOGD_TARGET)
 	rm -f $(BUILD)/libreecho-waked $(BUILD)/libreecho-waked-arm32 \
-		$(BUILD)/libreecho-waked-onnx-arm32 \
+		$(BUILD)/libreecho-waked-mww-arm32 \
 		$(BUILD)/test-voice-aec $(BUILD)/test-voice-reference \
 		$(BUILD)/test-voice-aec-guard \
 		$(BUILD)/test-voice-ns $(BUILD)/test-voice-pipeline-noise \
@@ -1550,10 +1558,9 @@ clean:
 		$(BUILD)/test-home-assistant-discovery \
 		$(BUILD)/libreecho-sttd-sherpa-arm32 \
 		$(BUILD)/sttd.arm.o $(BUILD)/stt_engine_sherpa.arm.o \
-		$(BUILD)/test-wake-engine-arm32 $(BUILD)/wake-adapter-client-arm32 \
+		$(BUILD)/wake-adapter-client-arm32 \
 		$(BUILD)/stt-stream-file-client-arm32 \
-		$(BUILD)/*.wake.arm.o $(BUILD)/wake_engine_onnx.arm.o \
-		$(BUILD)/test_wake_engine.arm.o
+		$(BUILD)/*.mww.arm.o $(BUILD)/wake_engine_mww.arm.o
 
 # Runs the real HTTP request processor with isolated mock device operations.
 $(BUILD)/test-setup-workers: tests/test_setup_workers.c src/http_server.c src/http_config_worker.inc $(filter-out $(BUILD)/main.o $(BUILD)/http_server.o,$(OBJECTS))

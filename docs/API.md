@@ -2733,18 +2733,30 @@ migrated or rewritten by viewing the page or saving sensitivity.
 
 #### Owner-staged wake models
 
-An owner-staged model is a folder under `/data/libreecho/wakeword-models/<name>/`
-holding `melspectrogram.onnx`, `embedding_model.onnx` and `alexa_v0.1.onnx` (the
-classifier, whatever the word is). The contract is in
-`docs/wake-word-training.md` in the product repository. The stock model is
-always installed and remains the default. Folder names may use letters, digits,
-`.`, `_` and `-`, may not start with `.`, may be 63 characters at most, and
-`alexa_v0.1` is reserved for the stock model.
+An owner-staged model is a microWakeWord folder under
+`/data/libreecho/wakeword-models/<name>/` holding exactly two regular files:
+`<name>.tflite` (TensorFlow Lite Micro model) and `<name>.json` (its manifest).
+The manifest declares `type: "micro"`, `version: 2`, a non-empty `wake_word`,
+`model` equal to `<name>.tflite`, and a `micro` object with
+`probability_cutoff` (0–1), `sliding_window_size`, `feature_step_size` and
+`tensor_arena_size` (1–65536 bytes). The model must have one subgraph, an int8
+`[1, N, 40]` input, a uint8 `[1, 1]` output, and only the operators the device
+resolver registers. The contract is in `docs/wake-word-training.md` in the
+product repository. The stock model is always installed and remains the
+default. Folder names may use letters, digits, `.`, `_` and `-`, may not start
+with `.`, may be 63 characters at most; `alexa` and `vad` are reserved.
+
+The bundled `vad` folder is copied to
+`/data/libreecho/wakeword-models/vad/` the first time an owner model runs, so
+every word folder shares one VAD model beside it. That copy is not listed as a
+selectable word. A folder holding anything other than the required pair fails
+the check and the device falls back to the stock word.
 
 Uploads are chunked because a request body is capped at 16 KiB: each file is
-sent as base64 chunks that decode to at most 8192 bytes, each file is at most
-8 MiB, and a chunk's `offset` must equal the bytes already staged for that file.
-Nothing is installed until `commit` passes.
+sent as base64 chunks that decode to at most 8192 bytes, a model file is at
+most 8 MiB, a manifest at most 64 KiB, and a chunk's `offset` must equal the
+bytes already staged for that file. Nothing is installed until `commit`
+passes.
 
 `GET /api/v1/wake-word/models` lists committed folders with validation results:
 
@@ -2752,44 +2764,53 @@ Nothing is installed until `commit` passes.
 {
   "ok": true,
   "data": {
-    "stock": {"name": "alexa_v0.1", "wake_word": "Alexa"},
+    "stock": {"name": "alexa", "wake_word": "Alexa", "phrase": "Alexa"},
     "selected": "my-word",
     "selection_error": false,
     "models": [
-      {"name": "my-word", "valid": true, "reason": "", "bytes": 2650112, "selected": true}
+      {"name": "my-word", "phrase": "My Word", "valid": true, "reason": "", "bytes": 2650112, "selected": true}
     ],
     "truncated": false,
-    "limits": {"files": 3, "file_bytes_max": 8388608, "chunk_bytes_max": 8192}
+    "limits": {"files": 2, "file_bytes_max": 8388608, "chunk_bytes_max": 8192}
   },
   "error": null
 }
 ```
 
 `PUT /api/v1/wake-word/model` with `{"model": "my-word"}` selects a committed
-folder; `{"model": "alexa_v0.1"}` or `{"model": ""}` selects the stock model. The
-response carries `restart_required: true`: the wake service reads the selection
-when it starts, so the change applies after a reboot or
-`/etc/init.d/libreecho-waked.init restart`. A folder that fails the check cannot
-be selected (`400`), and a missing one returns `404`.
+folder; `{"model": "alexa"}` or `{"model": ""}` selects the stock model.
+The selection is written to `/data/libreecho/config/wake-model`, mirrored into
+`esphome_active_wake_word` for Home Assistant, and applied immediately: the
+response is `200` with `{"selected": "my-word", "restarting": true}` and the
+main process restarts the wake service (`libreecho-waked.init restart`, which
+also bounces `micd` because it holds waked's only stream offer). Concurrent
+selections coalesce into one restart. There is no `restart_required` field; the
+new model is in use once the restart completes. A folder that fails the check
+cannot be selected (`400`), and a missing one returns `404`.
 
 `POST /api/v1/wake-word/models/{name}/files/{file}` with
-`{"offset": 0, "data": "<base64>"}` stages one chunk. `file` is one of the three
-names above.
+`{"offset": 0, "data": "<base64>"}` stages one chunk. `file` is `<name>.json`
+or `<name>.tflite` for that folder.
 
 `POST /api/v1/wake-word/models/{name}/commit` checks the staged files and moves
-the folder into place. The check covers the names and sizes of the three files,
-the graph input and output names, the operators, opset 13 and Sigmoid output of
-the classifier, and the absence of external weight data. A folder that fails is
-discarded and the `422` response says why. Shapes are not checked here; the
-detector refuses a model it cannot load and falls back to the stock model.
+the folder into place. The check covers the two file names and sizes, every
+manifest field and the arena cap, and the model's FlatBuffer structure: bounds,
+one subgraph, the input and output tensor types and shapes, the allowed
+operators, and the absence of a custom operator. A folder that fails is
+discarded and the `422` response says why.
 
 `DELETE /api/v1/wake-word/models/{name}` removes a folder. The selected folder
 cannot be removed (`409`); select the stock model first.
 
 The wake status reports the loaded model: `wake_word` is `Alexa` for the stock
-model and the folder name for an owner-staged one, and `model` is `alexa_v0.1` or
-the folder name. Detection events carry at most 23 characters of the name. The
-ESPHome/Home Assistant wake selection still reports and accepts only `Alexa`.
+model and the manifest's `wake_word` (or a prettified folder name) for an
+owner-staged one, and `model` is `alexa` or the folder name. Detection events
+carry at most 23 characters of the name. The ESPHome/Home Assistant voice
+configuration lists the stock model plus every
+valid staged model with the same derived phrase, reports the selection file's
+model as active, and accepts any listed id in `VoiceAssistantSetConfiguration`
+(an empty list disables wake). Selecting there writes the same selection file
+and mirrors the id, so both surfaces stay in agreement.
 
 #### POST /api/v1/wake-word/test
 

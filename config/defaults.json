@@ -14,7 +14,7 @@
   "led_visualizer_enabled": true,
   "wake_word": "Alexa",
   "wake_enabled": true,
-  "wake_sensitivity": 68,
+  "wake_sensitivity": 50,
   "voice_pipeline_mode": "local",
   "stt_wyoming_uri": "",
   "stt_wyoming_model": "whisper-small",

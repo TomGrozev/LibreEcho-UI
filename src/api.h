@@ -74,7 +74,10 @@ int discoverable,http_port,http_lan,discovery_fd;long discovery_retry,discovery_
 struct le_peer_key peer_key;char peer_key_path[512];int peer_key_loaded;
 /* Nearest-device answering (#408), off by default. Persisted here; waked
    reads it from the saved config and needs the pairing key as well. */
-int nearest_answers;/* Replay cache for group commands (#448). */struct le_peer_replay peer_replay;/* Device groups (#448), kept in peer-groups beside the config file. */struct le_group_set groups;char groups_path[512];int groups_loaded;};
+int nearest_answers;/* Replay cache for group commands (#448). */struct le_peer_replay peer_replay;/* Device groups (#448), kept in peer-groups beside the config file. */struct le_group_set groups;char groups_path[512];int groups_loaded;
+/* Waked restart supervision. Requests only drop a marker; api_tick (the main
+   process, never a forked request worker) owns the one child at a time. */
+int wake_restart_pid;unsigned long long wake_restart_deadline;};
 int api_request_authorize(struct api_context*,const struct api_request*,struct api_response*);
 int api_bootstrap_required(const struct api_context*);
 void api_set_https_active(struct api_context*,int);
@@ -84,8 +87,9 @@ void api_discovery_tick(struct api_context*);
 /* Records the plain HTTP listener so the advertisement names the right port. */
 void api_set_http_listener(struct api_context*,int port,int lan);
 /* Once-a-second server tick: reaps the tracked voice-pipeline restart and
-   starts its rollback after a failed forward transition. Never called from a
-   request path, so a GET stays read-only. */
+   starts its rollback after a failed forward transition, and advances a
+   pending wake-service restart. Never called from a request path, so a GET
+   stays read-only. */
 void api_tick(struct api_context*);
 int api_init(struct api_context*,struct le_backend*,int,int,const char*,const char*,const char*,const char*,const char*);int api_apply_persisted_configuration(struct api_context*,char*,size_t);int api_persist_configuration(struct api_context*);void api_log(struct api_context*,const char*,const char*);void api_handle(struct api_context*,const struct api_request*,struct api_response*);
 int api_diagnostics_kernel_authorize(struct api_context*,const struct api_request*,struct api_response*);int api_baby_monitor_stream_authorize(struct api_context*,const struct api_request*,struct api_response*,int*,int*,int*,int*,int*);

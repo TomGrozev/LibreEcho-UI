@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded host lifecycle regression; ONNX compute alone is scripted.
+"""Bounded host lifecycle regression; engine compute alone is scripted.
 
 Normal runner: python3 tests/test_esphome_wake_reload.py
 Optional staged SpeexDSP: SPEEXDSP_PREFIX=/path/to/prefix
@@ -42,6 +42,11 @@ def main():
         directory = Path(work)
         models = directory / "models"
         models.mkdir()
+        # The worker reads each model's tuned cutoff from its manifest; 0.69
+        # leaves a 0.2 sensitivity step between "0.8 does not wake" at
+        # sensitivity 0 and "0.9 wakes" at the startup sensitivity.
+        (models / "models.json").write_text(
+            '{"micro":{"probability_cutoff":0.69}}\n')
         for enabled in (True, False):
             binary = directory / ("enabled" if enabled else "disabled")
             cmd = shlex.split(os.environ.get("CC", "cc")) + [
@@ -50,7 +55,7 @@ def main():
                 "-Wl,--gc-sections", "-Isrc", "-Isrc/adapter",
             ]
             if enabled:
-                cmd += ["-DLE_WAKE_ENGINE_ONNX"]
+                cmd += ["-DLE_WAKE_ENGINE_MWW"]
             cmd += SOURCES
             if enabled:
                 cmd += ["src/adapter/wake_worker.c", "src/wake_model.c"]

@@ -1,541 +1,403 @@
 /*
- * Wake decoding: the score window is judged by its peak, not by its newest
- * frame.
+ * Wake decoding: the microWakeWord accept rule.
  *
- * The support rule exists so a single noisy frame cannot wake the device.
- * Testing it against the newest score alone made it unsatisfiable for any
- * detection that rises quickly, because the two frames it looks back at are by
- * definition the approach to the peak and still low. This exercises the real
- * decoder against the sequence measured on hardware, and against the lone
- * spike the rule is there to reject.
+ * A word is accepted when its sliding-window mean reaches the cutoff and the
+ * vad model's window mean reaches 0.5. After a wake, the word is disarmed for
+ * one second of audio and stays disarmed until its mean falls below the
+ * cutoff. The owner's sensitivity moves the cutoff around the value the model
+ * was trained with (50 leaves it unchanged).
  *
- * The ONNX engine is faked so score sequences can be scripted exactly. The
- * worker, its queue, its thread and decode_score() are the real ones.
+ * The engine is faked so score sequences and the vad mean can be scripted
+ * exactly. The worker, its queue, its thread and the decoder are the real
+ * ones.
  */
 
-#include "adapter/wake_worker.h"
 #include "adapter/wake_engine.h"
+#include "adapter/wake_worker.h"
 
 #include <assert.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
 #define BLOCK_SAMPLES 1280u
-#define ACCEPT_THRESHOLD 0.533f
-#define MAX_FRAMES 8u
+#define MAX_FRAMES 64u
 
-/* ---- faked engine: returns the scripted score, one per fed block ---- */
+/* ---- faked engine: one scripted score per fed block ---- */
 
 struct le_wake_engine {
-    int unused;
+  int unused;
 };
 
 static struct le_wake_engine fake_engine;
-static const float *script_scores;
+static const float *script1;
+static const float *script2;
+static const float *script_vad;
 static size_t script_count;
 static size_t script_position;
-
-/* Second word: its script is used only when the engine was created with a
- * second classifier, as the real engine would run it. */
-static const float *script2_scores;
+static volatile unsigned int consumed_blocks;
 static int fake_has_second;
+static unsigned int fake_inference_us;
 
-struct le_wake_engine *le_wake_engine_create_words(
-    const char *model_directory, unsigned int threads,
-    const char *second_classifier)
-{
-    (void)model_directory;
-    (void)threads;
-    script_position = 0;
-    fake_has_second = second_classifier != NULL;
-    return &fake_engine;
+struct le_wake_engine *
+le_wake_engine_create_words(const char *model_directory, unsigned int threads,
+                            const char *second_classifier) {
+  (void)model_directory;
+  (void)threads;
+  script_position = 0;
+  consumed_blocks = 0;
+  fake_has_second = second_classifier != NULL;
+  return &fake_engine;
 }
 
 int le_wake_engine_feed_words(struct le_wake_engine *engine,
-                              const int16_t *samples,
-                              size_t count,
-                              float *scores,
-                              size_t score_slots,
-                              int *new_score)
-{
-    (void)engine;
-    (void)samples;
-    (void)count;
-    scores[0] = script_position < script_count
-        ? script_scores[script_position] : 0.0f;
-    if (score_slots > 1)
-        scores[1] = fake_has_second && script2_scores &&
-            script_position < script_count
-            ? script2_scores[script_position] : 0.0f;
-    ++script_position;
-    /*
-     * Always a new score: the real engine produces one per 1280 samples, and
-     * the worker treats "no new score" as an engine failure and stops.
-     */
-    *new_score = 1;
-    return 0;
+                              const int16_t *samples, size_t count,
+                              float *scores, size_t score_slots,
+                              int *new_score) {
+  (void)engine;
+  (void)samples;
+  (void)count;
+  scores[0] = script_position < script_count ? script1[script_position] : 0.0f;
+  if (score_slots > 1)
+    scores[1] = fake_has_second && script2 && script_position < script_count
+                    ? script2[script_position]
+                    : 0.0f;
+  ++script_position;
+  /* The consumer thread: the harness waits on this before feeding more. */
+  ++consumed_blocks;
+  /* Always a new score; "no new score" means an engine failure to the
+   * worker, which is covered elsewhere. */
+  *new_score = 1;
+  return 0;
 }
 
-unsigned int le_wake_engine_last_inference_us(
-    const struct le_wake_engine *engine)
-{
-    (void)engine;
-    return 0;
+float le_wake_engine_vad_score(const struct le_wake_engine *engine) {
+  (void)engine;
+  if (script_vad && script_position > 0 && script_position <= script_count)
+    return script_vad[script_position - 1];
+  return 0.0f;
 }
 
-void le_wake_engine_destroy(struct le_wake_engine *engine)
-{
-    (void)engine;
+int le_wake_engine_has_vad(const struct le_wake_engine *engine) {
+  (void)engine;
+  return 1;
+}
+
+unsigned int
+le_wake_engine_last_inference_us(const struct le_wake_engine *engine) {
+  (void)engine;
+  return fake_inference_us;
+}
+
+void le_wake_engine_destroy(struct le_wake_engine *engine) { (void)engine; }
+
+/* ---- model directories ---- */
+
+/* A model directory needs <name>/<name>.json for the worker to read the
+ * manifest cutoff; the engine itself is faked. */
+static char model_root[] = "/tmp/le-wake-decode-XXXXXX";
+static char model_wake[128];
+static char model_twin[128];
+
+static void write_manifest(const char *directory, const char *name,
+                           float cutoff) {
+  char path[256];
+  FILE *file;
+
+  assert(snprintf(path, sizeof(path), "%s/%s.json", directory, name) <
+         (int)sizeof(path));
+  file = fopen(path, "w");
+  assert(file);
+  fprintf(file, "{\"micro\":{\"probability_cutoff\":%.3f}}\n", (double)cutoff);
+  assert(fclose(file) == 0);
+}
+
+static void make_model_dirs(void) {
+  char path[256];
+
+  assert(mkdtemp(model_root) != NULL);
+  assert(snprintf(model_wake, sizeof(model_wake), "%s/wake", model_root) <
+         (int)sizeof(model_wake));
+  assert(snprintf(model_twin, sizeof(model_twin), "%s/twin", model_root) <
+         (int)sizeof(model_twin));
+  assert(snprintf(path, sizeof(path), "%s", model_wake) > 0);
+  assert(mkdir(path, 0700) == 0);
+  assert(snprintf(path, sizeof(path), "%s", model_twin) > 0);
+  assert(mkdir(path, 0700) == 0);
+  write_manifest(model_wake, "wake", 0.9f);
+  write_manifest(model_twin, "twin", 0.5f);
 }
 
 /* ---- harness ---- */
 
 struct capture {
-    unsigned int count;
-    struct le_wake_event events[MAX_FRAMES];
+  unsigned int count;
+  unsigned int near;
+  struct le_wake_event events[MAX_FRAMES];
 };
 
-static void on_wake_event(const struct le_wake_event *event, void *opaque)
-{
-    struct capture *capture = opaque;
+static void on_wake_event(const struct le_wake_event *event, void *opaque) {
+  struct capture *capture = opaque;
 
-    if (capture->count < MAX_FRAMES)
-        capture->events[capture->count] = *event;
-    ++capture->count;
+  if (capture->count < MAX_FRAMES)
+    capture->events[capture->count] = *event;
+  ++capture->count;
 }
-
-/*
- * Submit one 1280-sample block per scripted score, then stop. Stopping drains
- * the queue and joins the worker thread, so the result is deterministic
- * without sleeping. Sequences stay within the 8-block queue so nothing is
- * dropped.
- */
-static void run_sequence_mode(const float *scores, const int *vad_active,
-                         const int *playback_active,
-                         size_t count,
-                         struct capture *capture,
-                         struct le_wake_worker_metrics *metrics)
-{
-    struct le_wake_worker worker;
-    int16_t block[BLOCK_SAMPLES];
-    size_t i;
-
-    assert(count <= MAX_FRAMES);
-    memset(&worker, 0, sizeof(worker));
-    memset(block, 0, sizeof(block));
-    memset(capture, 0, sizeof(*capture));
-    script_scores = scores;
-    script_count = count;
-    script2_scores = NULL;
-
-    assert(le_wake_worker_start(&worker, "unused-model-dir", 1,
-                                ACCEPT_THRESHOLD, on_wake_event,
-                                capture) == 0);
-    for (i = 0; i < count; ++i) {
-        struct le_wake_observation observation;
-
-        memset(&observation, 0, sizeof(observation));
-        /* Frame n occupies samples [n*1280, (n+1)*1280). */
-        observation.detection_sample = (uint64_t)(i + 1) * BLOCK_SAMPLES;
-        observation.vad_score = 1.0f;
-        observation.vad_active = vad_active[i];
-        observation.playback_active = playback_active ? playback_active[i] : 0;
-        assert(le_wake_worker_submit(&worker, block, BLOCK_SAMPLES,
-                                     &observation) == 0);
-    }
-    le_wake_worker_stop(&worker, metrics);
-}
-
-static void run_sequence(const float *scores, const int *vad_active,
-                         size_t count, struct capture *capture,
-                         struct le_wake_worker_metrics *metrics)
-{
-    run_sequence_mode(scores, vad_active, NULL, count, capture, metrics);
-}
-
-static int close_to(float actual, float expected)
-{
-    return fabsf(actual - expected) < 1e-6f;
-}
-
-/*
- * Two wake words over one stream: scores1 is the first word's classifier and
- * scores2 the second's, both scored on the same blocks. The first model
- * directory is the stock one, so the first word is named alexa_v0.1.
- */
-static void run_two_words(const float *scores1, const float *scores2,
-                          const int *vad_active, size_t count,
-                          struct capture *capture,
-                          struct le_wake_worker_metrics *metrics)
-{
-    struct le_wake_worker worker;
-    int16_t block[BLOCK_SAMPLES];
-    size_t i;
-
-    assert(count <= MAX_FRAMES);
-    memset(&worker, 0, sizeof(worker));
-    memset(block, 0, sizeof(block));
-    memset(capture, 0, sizeof(*capture));
-    script_scores = scores1;
-    script2_scores = scores2;
-    script_count = count;
-
-    assert(le_wake_worker_start_words(&worker, "/usr/share/x/openwakeword", 1,
-                                      ACCEPT_THRESHOLD,
-                                      "/data/x/twin-word/alexa_v0.1.onnx",
-                                      "twin-word", on_wake_event,
-                                      capture) == 0);
-    for (i = 0; i < count; ++i) {
-        struct le_wake_observation observation;
-
-        memset(&observation, 0, sizeof(observation));
-        observation.detection_sample = (uint64_t)(i + 1) * BLOCK_SAMPLES;
-        observation.vad_score = 1.0f;
-        observation.vad_active = vad_active[i];
-        assert(le_wake_worker_submit(&worker, block, BLOCK_SAMPLES,
-                                     &observation) == 0);
-    }
-    le_wake_worker_stop(&worker, metrics);
-}
-
-/* ---- near-miss harness ---- */
-
-struct near_capture {
-    unsigned int count;
-    struct le_wake_near_miss last;
-    size_t last_samples;
-    int16_t first_sample;
-    int16_t newest_sample;
-};
 
 static void on_near_miss(const struct le_wake_near_miss *miss,
-                         const int16_t *samples, size_t count, void *opaque)
-{
-    struct near_capture *capture = opaque;
+                         const int16_t *samples, size_t count, void *opaque) {
+  struct capture *capture = opaque;
 
-    ++capture->count;
-    capture->last = *miss;
-    capture->last_samples = count;
-    capture->first_sample = count ? samples[0] : 0;
-    capture->newest_sample = count ? samples[count - 1] : 0;
+  (void)miss;
+  (void)samples;
+  (void)count;
+  ++capture->near;
+}
+
+static void short_sleep(void) {
+  struct timespec slice = {0, 100000};
+
+  nanosleep(&slice, NULL);
+}
+
+static int close_to(float actual, float expected) {
+  return fabsf(actual - expected) < 1e-6f;
+}
+
+struct scenario {
+  struct le_wake_worker worker;
+  struct capture capture;
+  int16_t block[BLOCK_SAMPLES];
+  unsigned int fed;
+};
+
+/* The scripts live at file scope so the inference thread never reads a dead
+ * stack slot. */
+static float feed_score1, feed_score2, feed_vad;
+
+/*
+ * Feed one block and wait until the inference thread has consumed it, so the
+ * queue never fills and the outcome does not depend on scheduling.
+ */
+static void feed_block(struct scenario *scenario, float score1, float score2,
+                       float vad) {
+  struct le_wake_observation observation;
+  unsigned int before, wait;
+
+  feed_score1 = score1;
+  feed_score2 = score2;
+  feed_vad = vad;
+  script1 = &feed_score1;
+  script2 = &feed_score2;
+  script_vad = &feed_vad;
+  script_count = 1;
+  script_position = 0;
+  memset(&observation, 0, sizeof(observation));
+  observation.detection_sample = (uint64_t)(scenario->fed + 1) * BLOCK_SAMPLES;
+  observation.vad_score = vad;
+  observation.vad_active = vad >= 0.5f;
+  before = consumed_blocks;
+  assert(le_wake_worker_submit(&scenario->worker, scenario->block,
+                               BLOCK_SAMPLES, &observation) == 0);
+  ++scenario->fed;
+  for (wait = 0; consumed_blocks == before && wait < 100000; ++wait)
+    short_sleep();
+  assert(consumed_blocks == before + 1);
+}
+
+static void feed(struct scenario *scenario, float score, float vad) {
+  feed_block(scenario, score, 0.0f, vad);
+}
+
+static void begin(struct scenario *scenario, const char *directory,
+                  int sensitivity) {
+  memset(scenario, 0, sizeof(*scenario));
+  assert(le_wake_worker_start(&scenario->worker, directory, 1, sensitivity,
+                              on_wake_event, &scenario->capture) == 0);
+}
+
+static void finish(struct scenario *scenario,
+                   struct le_wake_worker_metrics *metrics) {
+  le_wake_worker_stop(&scenario->worker, metrics);
 }
 
 /*
- * Like run_sequence_mode, but enables near-miss reporting after start. Block
- * i is filled with the value i+1 so the snapshot order can be checked.
+ * One second of audio below the cutoff drains the start refractory, which is
+ * where the reading that follows actually begins.
  */
-static void run_near_miss(const float *scores, const int *vad_active,
-                          size_t count, float floor,
-                          struct near_capture *near,
-                          struct le_wake_worker_metrics *metrics,
-                          int *set_result)
-{
-    struct le_wake_worker worker;
-    struct capture ignored;
-    int16_t block[BLOCK_SAMPLES];
-    size_t i, k;
+static void prime(struct scenario *scenario, float below_cutoff) {
+  unsigned int i;
 
-    assert(count <= MAX_FRAMES);
-    memset(&worker, 0, sizeof(worker));
-    memset(&ignored, 0, sizeof(ignored));
-    memset(near, 0, sizeof(*near));
-    script_scores = scores;
-    script_count = count;
-
-    assert(le_wake_worker_start(&worker, "unused-model-dir", 1,
-                                ACCEPT_THRESHOLD, on_wake_event,
-                                &ignored) == 0);
-    *set_result = le_wake_worker_set_near_miss(&worker, floor,
-                                               on_near_miss, near);
-    for (i = 0; i < count; ++i) {
-        struct le_wake_observation observation;
-
-        for (k = 0; k < BLOCK_SAMPLES; ++k)
-            block[k] = (int16_t)(i + 1);
-        memset(&observation, 0, sizeof(observation));
-        observation.detection_sample = (uint64_t)(i + 1) * BLOCK_SAMPLES;
-        observation.vad_score = 1.0f;
-        observation.vad_active = vad_active[i];
-        assert(le_wake_worker_submit(&worker, block, BLOCK_SAMPLES,
-                                     &observation) == 0);
-    }
-    le_wake_worker_stop(&worker, metrics);
+  for (i = 0; i < 13; ++i)
+    feed(scenario, below_cutoff, 0.0f);
 }
 
-int main(void)
-{
-    struct le_wake_worker_metrics metrics;
-    struct capture capture;
+/* ---- cases ---- */
 
-    /* Playback belongs to the peak observation, not a later frame. */
-    {
-        static const float scores[] = {0.05f, 0.70f, 0.05f, 0.05f};
-        static const float low[] = {0.05f, 0.40f, 0.05f, 0.05f};
-        static const int voiced[] = {1, 1, 1, 1};
-        static const int unvoiced_peak[] = {1, 0, 1, 1};
-        static const int playback[] = {1, 1, 1, 1};
-        static const int late_playback[] = {0, 0, 1, 1};
-        run_sequence_mode(scores, voiced, playback, 4, &capture, &metrics);
-        assert(capture.count == 1);
-        assert(capture.events[0].playback_active);
-        assert(capture.events[0].detection_sample == 2U * BLOCK_SAMPLES);
-        run_sequence_mode(low, voiced, playback, 4, &capture, &metrics);
-        assert(capture.count == 0);
-        run_sequence_mode(scores, unvoiced_peak, playback, 4, &capture, &metrics);
-        assert(capture.count == 0);
-        run_sequence_mode(scores, voiced, late_playback, 4, &capture, &metrics);
-        assert(capture.count == 0);
-    }
+int main(void) {
+  struct le_wake_worker_metrics metrics;
+  struct scenario scenario;
+  uint64_t dropped;
+  unsigned int max_us;
 
-    /*
-     * The sequence measured on hardware. The 0.554 clears the 0.533 accept
-     * threshold on frame 3, but only one of the three scores in that window
-     * is above the support line, so frame 3 alone is not enough. Frame 4 adds
-     * the second supporting score, and the peak is still visible in the
-     * window -- so the detection fires on frame 4 and is attributed to the
-     * frame that actually peaked.
-     *
-     * Judged by the newest frame instead, frame 4 would be tested as 0.414,
-     * under the accept threshold, and the utterance would be lost. That is
-     * the regression this guards.
-     */
-    {
-        static const float measured[] = {0.083f, 0.102f, 0.554f, 0.414f};
-        static const int vad_active[] = {1, 1, 1, 1};
+  make_model_dirs();
 
-        run_sequence(measured, vad_active, 4, &capture, &metrics);
-        assert(capture.count == 1);
-        /* Attributed to frame 3's peak, not to frame 4's newest score. */
-        assert(close_to(capture.events[0].score, 0.554f));
-        assert(capture.events[0].detection_sample == 3u * BLOCK_SAMPLES);
-        assert(metrics.events == 1);
-        assert(metrics.scores == 4);
-        assert(metrics.dropped_blocks == 0);
-        assert(!metrics.failed);
-    }
+  /* A window mean at the manifest cutoff with a voiced window is a wake. */
+  {
+    struct scenario s;
 
-    /*
-     * A lone spike is still rejected. The peak clears the accept threshold by
-     * a wide margin, but no neighbouring frame reaches the support line, so
-     * support never exceeds one. This is what stops the peak rule degenerating
-     * into "any single frame over the threshold wakes the device".
-     */
-    {
-        static const float spike[] = {0.05f, 0.90f, 0.05f, 0.05f, 0.05f};
-        static const int vad_active[] = {1, 1, 1, 1, 1};
+    fake_inference_us = 7;
+    begin(&s, model_wake, 50);
+    prime(&s, 0.10f);
+    feed(&s, 0.90f, 0.9f);
+    assert(s.capture.count == 1);
+    assert(close_to(s.capture.events[0].score, 0.90f));
+    assert(s.capture.events[0].vad_score >= 0.5f);
+    /* The live counters the status line reads, before the summary. */
+    assert(le_wake_worker_status(&s.worker, &dropped, &max_us) == 0);
+    assert(max_us == 7);
+    assert(dropped == 0);
+    finish(&s, &metrics);
+    assert(metrics.events == 1);
+    assert(metrics.max_inference_us == 7);
+  }
 
-        run_sequence(spike, vad_active, 5, &capture, &metrics);
-        assert(capture.count == 0);
-        assert(metrics.events == 0);
-        assert(metrics.scores == 5);
-        assert(!metrics.failed);
-        /* The spike was seen and scored; it was judged, not missed. */
-        assert(close_to(metrics.max_score, 0.90f));
-    }
+  /* Below the cutoff is not a wake, however loud the voice. */
+  {
+    begin(&scenario, model_wake, 50);
+    prime(&scenario, 0.10f);
+    feed(&scenario, 0.80f, 0.9f);
+    assert(scenario.capture.count == 0);
+    finish(&scenario, &metrics);
+    assert(metrics.events == 0);
+  }
 
-    /*
-     * VAD gate still applies, and it is now read from the peak frame's
-     * observation rather than the newest one. The peak frame is active while
-     * the newest frame is inactive, so a decoder that reads the newest frame
-     * would incorrectly suppress this event.
-     */
-    {
-        static const float measured[] = {0.083f, 0.102f, 0.554f, 0.414f};
-        static const int vad_active[] = {1, 1, 1, 0};
+  /* The vad model vetoes a word that clears the cutoff. */
+  {
+    begin(&scenario, model_wake, 50);
+    prime(&scenario, 0.10f);
+    feed(&scenario, 0.95f, 0.40f);
+    assert(scenario.capture.count == 0);
+    finish(&scenario, &metrics);
+  }
 
-        run_sequence(measured, vad_active, 4, &capture, &metrics);
-        assert(capture.count == 1);
-        assert(close_to(capture.events[0].score, 0.554f));
-        assert(capture.events[0].detection_sample == 3u * BLOCK_SAMPLES);
-        assert(metrics.events == 1);
-    }
+  /* A band window without a wake is a near miss. */
+  {
+    begin(&scenario, model_twin, 50); /* cutoff 0.5 */
+    prime(&scenario, 0.10f);
+    assert(le_wake_worker_set_near_miss(&scenario.worker, 0.35f, on_near_miss,
+                                        &scenario.capture) == 0);
+    feed(&scenario, 0.40f, 0.9f);
+    assert(scenario.capture.count == 0);
+    assert(scenario.capture.near == 1);
+    finish(&scenario, &metrics);
+    assert(metrics.near_misses == 1);
+  }
 
-    /*
-     * Lockout is armed from the peak frame's sample. After the detection on
-     * frame 3, the later pair of 0.60 scores would otherwise satisfy both the
-     * accept threshold and support, but every one of their samples falls
-     * inside the 28000-sample lockout, so exactly one event is reported.
-     */
-    {
-        static const float repeated[] = {
-            0.083f, 0.102f, 0.554f, 0.414f, 0.10f, 0.60f, 0.60f, 0.10f
-        };
-        static const int vad_active[] = {1, 1, 1, 1, 1, 1, 1, 1};
+  /* The utterance that woke the device is not reported as a near miss on its
+   * falling edge, while the word is still disarmed. */
+  {
+    begin(&scenario, model_twin, 50);
+    prime(&scenario, 0.10f);
+    assert(le_wake_worker_set_near_miss(&scenario.worker, 0.35f, on_near_miss,
+                                        &scenario.capture) == 0);
+    feed(&scenario, 0.90f, 0.9f);
+    assert(scenario.capture.count == 1);
+    feed(&scenario, 0.40f, 0.9f);
+    assert(scenario.capture.near == 0);
+    finish(&scenario, &metrics);
+    assert(metrics.near_misses == 0);
+  }
 
-        run_sequence(repeated, vad_active, 8, &capture, &metrics);
-        assert(capture.count == 1);
-        assert(capture.events[0].detection_sample == 3u * BLOCK_SAMPLES);
-        assert(metrics.events == 1);
-        assert(metrics.scores == 8);
-        assert(metrics.dropped_blocks == 0);
-    }
+  /* One wake, then silence for a second, then the word fires again. */
+  {
+    unsigned int i;
 
-    /*
-     * Two words. Each word decodes on its own scores and names itself in the
-     * event. The first word, scored on the stock folder, is alexa_v0.1; the
-     * second is the configured name.
-     */
-    {
-        static const float measured[] = {0.083f, 0.102f, 0.554f, 0.414f};
-        static const float quiet[] = {0.05f, 0.05f, 0.05f, 0.05f};
-        static const int vad_active[] = {1, 1, 1, 1};
+    begin(&scenario, model_wake, 50);
+    prime(&scenario, 0.10f);
+    feed(&scenario, 0.95f, 0.9f);
+    assert(scenario.capture.count == 1);
+    /* Inside the refractory: the score is at the cutoff but dropped. */
+    feed(&scenario, 0.95f, 0.9f);
+    assert(scenario.capture.count == 1);
+    for (i = 0; i < 13; ++i)
+      feed(&scenario, 0.10f, 0.0f);
+    feed(&scenario, 0.95f, 0.9f);
+    assert(scenario.capture.count == 2);
+    finish(&scenario, &metrics);
+    assert(metrics.events == 2);
+  }
 
-        /* Only the second word fires: its event carries its own name. */
-        run_two_words(quiet, measured, vad_active, 4, &capture, &metrics);
-        assert(capture.count == 1);
-        assert(strcmp(capture.events[0].model_name, "twin-word") == 0);
-        assert(close_to(capture.events[0].score, 0.554f));
-        assert(capture.events[0].detection_sample == 3u * BLOCK_SAMPLES);
-        assert(metrics.events == 1);
-        assert(metrics.scores == 4);
+  /* Sensitivity 100 lowers the 0.9 cutoff to 0.7, 0 raises it to 0.99. */
+  {
+    begin(&scenario, model_wake, 100);
+    prime(&scenario, 0.10f);
+    feed(&scenario, 0.75f, 0.9f);
+    assert(scenario.capture.count == 1);
+    finish(&scenario, &metrics);
 
-        /* Only the first word fires. */
-        run_two_words(measured, quiet, vad_active, 4, &capture, &metrics);
-        assert(capture.count == 1);
-        assert(strcmp(capture.events[0].model_name, "alexa_v0.1") == 0);
-        assert(metrics.events == 1);
+    begin(&scenario, model_wake, 0);
+    prime(&scenario, 0.10f);
+    feed(&scenario, 0.75f, 0.9f);
+    assert(scenario.capture.count == 0);
+    /* 0.95 is under 0.99 too. */
+    feed(&scenario, 0.95f, 0.9f);
+    assert(scenario.capture.count == 0);
+    finish(&scenario, &metrics);
+  }
 
-        /* Both fire on the same utterance: two events, first word first. */
-        run_two_words(measured, measured, vad_active, 4, &capture, &metrics);
-        assert(capture.count == 2);
-        assert(strcmp(capture.events[0].model_name, "alexa_v0.1") == 0);
-        assert(strcmp(capture.events[1].model_name, "twin-word") == 0);
-        assert(metrics.events == 2);
-        assert(metrics.scores == 4);
+  /* 50 keeps the manifest cutoff: 0.85 no, 0.95 yes. */
+  {
+    begin(&scenario, model_wake, 50);
+    prime(&scenario, 0.10f);
+    feed(&scenario, 0.85f, 0.9f);
+    assert(scenario.capture.count == 0);
+    feed(&scenario, 0.95f, 0.9f);
+    assert(scenario.capture.count == 1);
+    finish(&scenario, &metrics);
+  }
 
-        /*
-         * The single-word worker ignores the second slot: the same second
-         * stream does nothing without a second classifier configured.
-         */
-        run_sequence(quiet, vad_active, 4, &capture, &metrics);
-        assert(capture.count == 0);
-        run_sequence_mode(quiet, vad_active, NULL, 4, &capture, &metrics);
-        assert(capture.count == 0);
-        assert(metrics.events == 0);
-    }
+  /* A live sensitivity change reaches the running model. */
+  {
+    begin(&scenario, model_wake, 0);
+    prime(&scenario, 0.10f);
+    feed(&scenario, 0.75f, 0.9f);
+    assert(scenario.capture.count == 0);
+    assert(le_wake_worker_set_sensitivity(&scenario.worker, 100) == 0);
+    feed(&scenario, 0.75f, 0.9f);
+    assert(scenario.capture.count == 1);
+    finish(&scenario, &metrics);
+  }
 
-    /*
-     * Near misses. A peak between the 0.35 floor and the 0.533 accept
-     * threshold, with speech present, is reported with no detection. The
-     * snapshot is oldest-first and ends at the window that produced it.
-     */
-    {
-        static const float low[] = {0.05f, 0.40f, 0.05f, 0.05f};
-        static const int voiced[] = {1, 1, 1, 1};
-        struct near_capture near;
-        int set_result = -1;
+  /* Out-of-range sensitivities are refused at start and live. */
+  {
+    memset(&scenario, 0, sizeof(scenario));
+    assert(le_wake_worker_start(&scenario.worker, model_wake, 1, 101,
+                                on_wake_event, &scenario.capture) < 0);
+  }
 
-        run_near_miss(low, voiced, 4, 0.35f, &near, &metrics, &set_result);
-        assert(set_result == 0);
-        assert(near.count == 1);
-        assert(metrics.near_misses == 1);
-        assert(metrics.events == 0);
-        assert(close_to(near.last.score, 0.40f));
-        assert(near.last.detection_sample == 2u * BLOCK_SAMPLES);
-        assert(close_to(near.last.accept_threshold, ACCEPT_THRESHOLD));
-        /* Frame 2 is the peak: history holds frames 1 and 2 at the time. */
-        assert(near.last_samples == 2u * BLOCK_SAMPLES);
-        assert(near.first_sample == 1);
-        assert(near.newest_sample == 2);
-    }
+  /* A second word decodes on its own and names itself in the event. */
+  {
+    unsigned int i;
 
-    /* Floor 0 is off: the same window reports nothing. */
-    {
-        static const float low[] = {0.05f, 0.40f, 0.05f, 0.05f};
-        static const int voiced[] = {1, 1, 1, 1};
-        struct near_capture near;
-        int set_result = -1;
+    memset(&scenario, 0, sizeof(scenario));
+    assert(le_wake_worker_start_words(&scenario.worker, model_wake, 1, 50,
+                                      model_twin, "twin", on_wake_event,
+                                      &scenario.capture) == 0);
+    for (i = 0; i < 13; ++i)
+      feed_block(&scenario, 0.0f, 0.0f, 0.9f);
+    feed_block(&scenario, 0.0f, 1.0f, 0.9f);
+    assert(scenario.capture.count == 1);
+    assert(!strcmp(scenario.capture.events[0].model_name, "twin"));
+    finish(&scenario, &metrics);
+  }
 
-        run_near_miss(low, voiced, 4, 0.0f, &near, &metrics, &set_result);
-        assert(set_result == 0);
-        assert(near.count == 0);
-        assert(metrics.near_misses == 0);
-    }
-
-    /* Unvoiced peaks are noise, not speech, so they are never reported. */
-    {
-        static const float low[] = {0.05f, 0.40f, 0.05f, 0.05f};
-        static const int unvoiced[] = {1, 0, 1, 1};
-        struct near_capture near;
-        int set_result = -1;
-
-        run_near_miss(low, unvoiced, 4, 0.35f, &near, &metrics, &set_result);
-        assert(near.count == 0);
-        assert(metrics.near_misses == 0);
-    }
-
-    /* A peak below the floor is not a near miss. */
-    {
-        static const float quiet[] = {0.05f, 0.20f, 0.05f, 0.05f};
-        static const int voiced[] = {1, 1, 1, 1};
-        struct near_capture near;
-        int set_result = -1;
-
-        run_near_miss(quiet, voiced, 4, 0.35f, &near, &metrics, &set_result);
-        assert(near.count == 0);
-        assert(metrics.near_misses == 0);
-    }
-
-    /* A peak that is accepted is a detection, never also a near miss. */
-    {
-        static const float measured[] = {0.083f, 0.102f, 0.554f, 0.414f};
-        static const int voiced[] = {1, 1, 1, 1};
-        struct near_capture near;
-        int set_result = -1;
-
-        run_near_miss(measured, voiced, 4, 0.35f, &near, &metrics, &set_result);
-        assert(near.count == 0);
-        assert(metrics.events == 1);
-        assert(metrics.near_misses == 0);
-    }
-
-    /* One utterance yields one clip: the second, higher peak is inside the
-     * near-miss lockout armed by the first. */
-    {
-        static const float twice[] = {0.40f, 0.42f, 0.05f, 0.05f};
-        static const int voiced[] = {1, 1, 1, 1};
-        struct near_capture near;
-        int set_result = -1;
-
-        run_near_miss(twice, voiced, 4, 0.35f, &near, &metrics, &set_result);
-        assert(near.count == 1);
-        assert(metrics.near_misses == 1);
-        assert(near.last.detection_sample == 1u * BLOCK_SAMPLES);
-    }
-
-    /* A floor at or above the accept threshold reports nothing. */
-    {
-        static const float low[] = {0.05f, 0.40f, 0.05f, 0.05f};
-        static const int voiced[] = {1, 1, 1, 1};
-        struct near_capture near;
-        int set_result = -1;
-
-        run_near_miss(low, voiced, 4, 0.60f, &near, &metrics, &set_result);
-        assert(set_result == 0);
-        assert(near.count == 0);
-        assert(metrics.near_misses == 0);
-    }
-
-    /* Invalid floors and a missing callback are refused. */
-    {
-        struct le_wake_worker worker;
-        struct capture ignored;
-
-        memset(&worker, 0, sizeof(worker));
-        memset(&ignored, 0, sizeof(ignored));
-        script_scores = NULL;
-        script_count = 0;
-        assert(le_wake_worker_start(&worker, "unused-model-dir", 1,
-                                    ACCEPT_THRESHOLD, on_wake_event,
-                                    &ignored) == 0);
-        assert(le_wake_worker_set_near_miss(&worker, 1.0f, on_near_miss, NULL) == -1);
-        assert(le_wake_worker_set_near_miss(&worker, -0.1f, on_near_miss, NULL) == -1);
-        assert(le_wake_worker_set_near_miss(&worker, 0.35f, NULL, NULL) == -1);
-        assert(le_wake_worker_set_near_miss(&worker, 0.0f, NULL, NULL) == 0);
-        le_wake_worker_stop(&worker, &metrics);
-    }
-
-    return 0;
+  printf("test_wake_decode: all cases passed\n");
+  return 0;
 }

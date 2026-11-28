@@ -14,6 +14,9 @@
 #include "../json.h"
 #include "../esphome_health.h"
 #include "../timezone.h"
+#include "../wake_model.h"
+#include "../wake_model_store.h"
+#include "../service_env.h"
 #include "adapter.h"
 #include "esphome_ble_proxy.h"
 #include <arpa/inet.h>
@@ -29,6 +32,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <mbedtls/base64.h>
@@ -98,6 +102,12 @@
 #define TEXT_STATE_TYPE 27U
 #define TEXT_VALUE_MAX 1024U
 #define HISTORY_GENERATION_KIND 13
+/* Wake models offered to Home Assistant: the stock model plus every valid
+ * owner-staged folder. Revalidating the graphs is a few megabytes of reads, so
+ * the list is refreshed at most once per TTL and after a selection change. */
+#define WAKE_MODELS_MAX 16U
+#define WAKE_LIST_TTL_MS 5000U
+#define WAKE_INIT_DEFAULT "/etc/init.d/libreecho-waked.init"
 #define NELEM(a) (sizeof(a)/sizeof((a)[0]))
 struct client { int fd,mode,phase,hello,states,closing,light,led_light,text_speech,level;unsigned char rx[RX_CAP],tx[TX_CAP];size_t rx_n,tx_n,tx_sent;uint64_t deadline,last_seen,ping_at,time_at;struct en_session noise; };
 struct io {int fd,stage,kind;char tx[2048],rx[4096];size_t tx_n,tx_sent,rx_n;uint64_t deadline;int target;};
@@ -115,6 +125,12 @@ struct state {
  int led_master,led_master_known,sensitivity,sensitivity_known;uint64_t settings_poll;
  int set_sent_known[4],set_sent_value[4],reply_sent_known,reply_sent;
  char name[32],friendly[64],mac[18];unsigned char psk[32];int provisioned,plaintext,ha_selected,ready,owner,turn,muted,local_mute_gate,privacy,volume,output_muted,restore_volume,radio_state,active_wake,reply_volume,voice_open,server_wake,server_turn;
+ /* The loaded wake model: the id Home Assistant lists/selects, its display
+  * phrase, and the owned list of stock plus valid staged models. */
+ char wake_model[LE_WAKE_MODEL_NAME_MAX],wake_phrase[64];
+ struct le_wake_model_paths wake_paths;int wake_paths_ok;
+ struct { char id[LE_WAKE_MODEL_NAME_MAX];char phrase[64]; } wake_list[WAKE_MODELS_MAX];
+ unsigned wake_list_count;uint64_t wake_list_at;const char *wake_init_path;
  uint64_t cancel_guard,control_retry;int control_fd;
  uint64_t now,server_retry,turn_deadline,turn_limit,last_audio_status,last_status_poll,wake_retry,mdns_retry,ring_first,ring_end,capture_next,timer_retry;
  int16_t ring[RING_SAMPLES];unsigned char mic_rx[24+2560];size_t mic_n;int mic_ack;
@@ -132,6 +148,11 @@ struct state {
  const char *agent_path;
 };
 static struct state S;static struct le_ble_proxy B;static volatile sig_atomic_t running=1,reload_config;
+/* One waked restart at a time. waked is micd's only stream consumer and micd
+ * offers it once, so the init script's restart bounces the pair (micd first).
+ * The child is tracked so a second selection coalesces into one more run
+ * instead of starting a competing restart. */
+static pid_t wake_restart_pid=-1;static int wake_restart_again;static uint64_t wake_restart_deadline;
 static void sigstop(int sig){if(sig==SIGHUP)reload_config=1;else running=0;}
 static uint64_t now_ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000+(unsigned)t.tv_nsec/1000000;}
 static void io_close(struct io *j){if(j->fd>=0)close(j->fd);j->fd=-1;j->stage=0;j->rx_n=j->tx_n=j->tx_sent=0;}
@@ -359,7 +380,7 @@ static int voice_start(uint64_t sample,int continued){unsigned char b[256];struc
     wake-word engine on the stream (ESPHome use_wake_word: true); the word was
     already detected here, so HA must start at STT -- with no HA wake engine the
     run otherwise fails instantly with wake-engine-missing. */
- ep_uint(&w,3,1);if(!continued)ep_string(&w,5,"Alexa");if(send_writer(&S.clients[S.owner],90,&w))return -1;
+ ep_uint(&w,3,1);if(!continued)ep_string(&w,5,S.wake_phrase);if(send_writer(&S.clients[S.owner],90,&w))return -1;
  S.capture_next=sample>3200?sample-3200:0;if(S.capture_next<S.ring_first)S.capture_next=S.ring_first;S.turn=1;S.turn_deadline=S.now+S.turn_limit;S.continue_turn=S.run_end=S.early_tts=S.tts_done=0;S.tts_url[0]=S.next_url[0]=0;S.announcement=0;S.pipeline=1;S.voice_open=1;S.duck=media_playing();if(!continued)event_send(ACTIVITY_VOICE_KEY,"wake_word");event_send(ACTIVITY_VOICE_KEY,"listening");profile("listening");wake_stop();status_write();return 0;
 }
 /* Server-side wake (esphome_server_wake, off by default): open an ESPHome run with
@@ -471,7 +492,93 @@ static void entities(struct client *c){unsigned char b[768],nested[80];struct ep
  services_list(c);
  (void)send_msg(c,19,NULL,0);
 }
-static void configuration(struct client *c){unsigned char b[256],x[128];struct ep_writer w={b,sizeof b,0,0},n={x,sizeof x,0,0};ep_string(&n,1,"alexa_v0.1");ep_string(&n,2,"Alexa");ep_string(&n,3,"en");ep_bytes(&w,1,x,n.length);if(S.active_wake)ep_string(&w,2,"alexa_v0.1");ep_uint(&w,3,1);(void)send_writer(c,122,&w);}
+/* ---- Wake model selection (owner-staged models, shared with the web API) ---- */
+static int config_set_string(const char *field,const char *value);
+static void wake_list_add(const char *id, const char *phrase){
+ if(S.wake_list_count>=WAKE_MODELS_MAX)return;
+ snprintf(S.wake_list[S.wake_list_count].id,sizeof S.wake_list[0].id,"%s",id);
+ snprintf(S.wake_list[S.wake_list_count].phrase,sizeof S.wake_list[0].phrase,"%s",phrase);
+ ++S.wake_list_count;
+}
+static void wake_list_seen(const struct le_wake_model_entry *e,void *opaque){char folder[400],phrase[64],model[LE_WAKE_MODEL_NAME_MAX];(void)opaque;
+ if(!e->valid)return;
+ snprintf(folder,sizeof folder,"%s/%s",S.wake_paths.models,e->name);
+ if(le_wake_model_label(folder,phrase,sizeof phrase,model,sizeof model)<0)return;
+ wake_list_add(e->name,phrase);
+}
+/* Stock first, then every committed folder that still passes the graph check.
+ * The scan is the same one the web API lists, so both surfaces agree. */
+static void wake_list_refresh(int force){uint64_t now=now_ms();
+ if(!S.wake_paths_ok)return;
+ if(!force&&S.wake_list_at&&now<S.wake_list_at+WAKE_LIST_TTL_MS)return;
+ S.wake_list_count=0;
+ wake_list_add(LE_WAKE_MODEL_STOCK_NAME,LE_WAKE_MODEL_STOCK_PHRASE);
+ (void)le_wake_model_scan(&S.wake_paths,wake_list_seen,NULL);
+ S.wake_list_at=now;
+}
+static int wake_list_has(const char *id){
+ if(!strcmp(id,LE_WAKE_MODEL_STOCK_NAME))return 1;
+ for(unsigned i=0;i<S.wake_list_count;i++)if(!strcmp(S.wake_list[i].id,id))return 1;
+ return 0;
+}
+static int wake_set_current(const char *id){char folder[400],model[LE_WAKE_MODEL_NAME_MAX];
+ if(!strcmp(id,LE_WAKE_MODEL_STOCK_NAME))snprintf(S.wake_phrase,sizeof S.wake_phrase,"%s",LE_WAKE_MODEL_STOCK_PHRASE);
+ else{
+  snprintf(folder,sizeof folder,"%s/%s",S.wake_paths.models,id);
+  if(le_wake_model_label(folder,S.wake_phrase,sizeof S.wake_phrase,model,sizeof model)<0)return -1;
+ }
+ snprintf(S.wake_model,sizeof S.wake_model,"%s",id);
+ return 0;
+}
+static int wake_restart_start(void);
+static void wake_restart_tick(void){
+ int status;pid_t r;
+ if(wake_restart_pid<=0)return;
+ r=waitpid(wake_restart_pid,&status,WNOHANG);
+ if(r==0){
+  /* A wedged init script must not pin the guard forever. */
+  if(wake_restart_deadline&&now_ms()>wake_restart_deadline){
+   (void)kill(-wake_restart_pid,SIGKILL);(void)kill(wake_restart_pid,SIGKILL);
+  }
+  return;
+ }
+ wake_restart_pid=-1;wake_restart_deadline=0;
+ if(wake_restart_again){wake_restart_again=0;(void)wake_restart_start();}
+}
+/* The init script applies the selection file at start. Its restart bounces
+ * micd too: waked is micd's only stream consumer and micd offers the stream
+ * once, so a waked restarted alone fails with a protocol error. */
+static int wake_restart_start(void){
+ const char *argv[3];pid_t child;
+ if(!S.wake_init_path||!S.wake_init_path[0])return -1;
+ if(wake_restart_pid>0){wake_restart_again=1;return 0;}
+ child=fork();
+ if(child==0){(void)setpgid(0,0);argv[0]=S.wake_init_path;argv[1]="restart";argv[2]=NULL;
+  _exit(le_service_command(S.wake_init_path,argv)?1:0);}
+ if(child<0)return -1;
+ wake_restart_pid=child;wake_restart_deadline=now_ms()+45000;
+ return 0;
+}
+/* Selection file first: it is what the init script and waked read, and the
+ * web API writes it through the same le_wake_model_select. The config field
+ * mirrors it for Home Assistant; the two surfaces never disagree on restart. */
+static int wake_apply(const char *id){
+ int stock=!strcmp(id,LE_WAKE_MODEL_STOCK_NAME);
+ int changed;
+ if(!S.wake_paths_ok)return -1;
+ if(!stock&&!wake_list_has(id))return -1;
+ changed=S.active_wake?strcmp(id,S.wake_model)!=0:1;
+ if(le_wake_model_select(&S.wake_paths,stock?NULL:id)!=LE_WAKE_MODEL_STORE_OK)return -1;
+ if(wake_set_current(id))return -1;
+ if(config_set_string("esphome_active_wake_word",id)<0)return -1;
+ S.active_wake=1;
+ wake_list_refresh(1);
+ if(changed&&wake_restart_start()<0)fprintf(stderr,"esphomed: wake service restart could not be started\n");
+ return 0;
+}
+static void configuration(struct client *c){unsigned char b[8192],x[256];struct ep_writer w={b,sizeof b,0,0},n={x,sizeof x,0,0};wake_list_refresh(0);
+ for(unsigned i=0;i<S.wake_list_count;i++){n.length=0;ep_string(&n,1,S.wake_list[i].id);ep_string(&n,2,S.wake_list[i].phrase);ep_string(&n,3,"en");ep_bytes(&w,1,x,n.length);}
+ if(S.active_wake)ep_string(&w,2,S.wake_model);ep_uint(&w,3,1);(void)send_writer(c,122,&w);}
 /* Preserve all unrelated fields; only replace a validated top-level string or
  * insert before the closing brace. config_store enforces 0600 + fsync/rename. */
 static char *top_field(char *json,const char *needle){int depth=0;size_t len=strlen(needle);for(char *q=json;*q;q++){
@@ -533,11 +640,12 @@ static void time_response(const void *p,size_t n){char raw[96],tz[64],current[64
  if(json_get_string_top_level(b,"timezone",current,sizeof current)==1&&!strcmp(current,tz))return;
  if(config_set_string("timezone",tz)||config_set_string("timezone_name",""))fprintf(stderr,"esphomed: Home Assistant time zone could not be saved\n");
  else fprintf(stderr,"esphomed: time zone set from Home Assistant: %s\n",tz);}
-/* Wake word on/off: the same persisted selection and waked set_word that VoiceAssistantSetConfiguration uses. */
+/* Wake word on/off. The model itself is the selection file's job; enabling
+ * only mirrors the loaded id so Home Assistant reports the right word. */
 static int wake_set_active(int active){
- if(config_set_string("esphome_active_wake_word",active?"alexa_v0.1":"")<0)return -1;
- if(!active){S.active_wake=0;cancel_turn("wake_disabled");return 0;}
- if(job(S.wake_path,"set_word","{\"word\":\"Alexa\"}",5,1)<0)return -1;S.active_wake=1;return 0;}
+ if(!active){if(config_set_string("esphome_active_wake_word","")<0)return -1;S.active_wake=0;cancel_turn("wake_disabled");return 0;}
+ if(config_set_string("esphome_active_wake_word",S.wake_model)<0)return -1;
+ S.active_wake=1;return 0;}
 /* NumberCommandRequest (#396). Integer 0-100 only, as the web API validates; each value goes to the
  * same daemon command the web API uses (set_volume, set_sensitivity, set_brightness). */
 static int number_command(const void *p,size_t n){unsigned key=(unsigned)ep_get_uint(p,n,1,0);uint32_t bits=(uint32_t)ep_get_uint(p,n,2,0);float v;char args[64];int target;
@@ -578,8 +686,11 @@ static int dispatch(unsigned idx,unsigned type,const unsigned char *p,size_t n){
   * next_url holds the announcement. A chime that cannot play is skipped, never the announcement. */
  {char pre[1024];snprintf(pre,sizeof pre,"%s",S.next_url);snprintf(S.next_url,sizeof S.next_url,"%s",url);if(!pre[0]||playback_start(pre)<0){S.next_url[0]=0;if(playback_start(url)<0)turn_clear("playback_error",1);}}status_write();return 0;
  case 121:configuration(c);return 0;
- case 123:{struct ep_reader r;struct ep_field f;unsigned count=0;int active=0;ep_reader_init(&r,p,n);while(ep_next(&r,&f)>0)if(f.number==1){if(++count>1||ep_text(&f,url,sizeof url)||strcmp(url,"alexa_v0.1"))return -1;active=1;}
- if(wake_set_active(active))return -1;configuration(c);return 0;}
+ case 123:{struct ep_reader r;struct ep_field f;unsigned count=0;int active=0;char word[LE_WAKE_MODEL_NAME_MAX];word[0]=0;ep_reader_init(&r,p,n);while(ep_next(&r,&f)>0)if(f.number==1){if(++count>1||ep_text(&f,word,sizeof word))return -1;active=1;}
+ if(count==1&&!word[0])active=0;
+ if(active){wake_list_refresh(1);if(!wake_list_has(word)||wake_apply(word))return -1;}
+ else if(wake_set_active(0))return -1;
+ configuration(c);return 0;}
  case LE_BLE_PROXY_MSG_SUBSCRIBE:if(!S.ble_proxy)return 0;return le_ble_proxy_subscribe(&B,(int)idx,p,n);
  case 124:return provision(c,p,n);
  case 33:if(ep_get_uint(p,n,1,0)==WAKE_SWITCH_KEY){if(wake_set_active(!!ep_get_uint(p,n,2,0)))return -1;all_states();settings_sync();return 0;}if(ep_get_uint(p,n,1,0)!=MUTE_KEY)return -1;{int mute=!!ep_get_uint(p,n,2,0);if(!mute&&S.privacy!=0){all_states();return 0;}if(mute){S.local_mute_gate=1;S.muted=1;if(S.turn==1)cancel_turn("muted");else if(S.turn==2)stop_capture("muted");all_states();}snprintf(args,sizeof args,"{\"muted\":%s}",mute?"true":"false");return job(S.audio_path,"set_mute",args,3,mute);}
@@ -682,7 +793,28 @@ static void light_poll(void){static const char *const probe[]={"/sys/bus/i2c/dev
 static void privacy_poll(void){char b[32];int n=config_read(S.privacy_path,b,sizeof b),old=S.privacy;if(n<0)S.privacy=-1;else if(b[0]=='0')S.privacy=0;else if(b[0]=='1')S.privacy=1;else S.privacy=-1;if(old!=S.privacy){if(mic_muted()&&(S.turn==1||S.turn==2))stop_capture("privacy");all_states();}}
 static int normalize_mac(const char *input,char *out){unsigned char b[6];unsigned n=0,high=0;int hi=-1;for(size_t i=0;input[i];i++){int x=input[i];if(x==':'||isspace((unsigned char)x))continue;if(x>='0'&&x<='9')x-='0';else if(x>='a'&&x<='f')x=x-'a'+10;else if(x>='A'&&x<='F')x=x-'A'+10;else return -1;if(hi<0)hi=x;else{if(n>=6)return -1;b[n++]=(unsigned char)(hi*16+x);high|=b[n-1];hi=-1;}}if(n!=6||hi>=0||!high||(b[0]&1))return -1;snprintf(out,18,"%02x:%02x:%02x:%02x:%02x:%02x",b[0],b[1],b[2],b[3],b[4],b[5]);return 0;}
 static int load_configuration(void){char b[16384],key[45],mac[64],name[64],wake[64];int n=config_read(S.config_path,b,sizeof b);struct le_esphome_config cfg;size_t z;if(n<0||config_esphome_read(S.config_path,&cfg))return -1;
- int selected=json_get_string_top_level(b,"esphome_active_wake_word",wake,sizeof wake);if(selected<0||json_duplicate_key(b,(size_t)n,"esphome_active_wake_word")||(selected>0&&wake[0]&&strcmp(wake,"alexa_v0.1")))return -1;S.active_wake=selected<=0||!!wake[0];
+ /* The selection file is the model truth: waked and the init script read it.
+  * A staged model that vanished falls back to stock and drops the stale file,
+  * the same fallback libreecho-waked.init performs at start. */
+ {char selection[LE_WAKE_MODEL_NAME_MAX];S.wake_model[0]=0;
+  S.wake_paths_ok=S.config_path[0]&&!le_wake_model_paths_from_config(S.config_path,&S.wake_paths);
+  if(S.wake_paths_ok){int sel=le_wake_model_selection_read(&S.wake_paths,selection,sizeof selection),valid=0;
+   if(sel==1){char folder[400],reason[160];valid=snprintf(folder,sizeof folder,"%s/%s",S.wake_paths.models,selection)<(int)sizeof folder&&!le_wake_model_validate_directory(folder,reason,sizeof reason);}
+   if(sel==1&&valid)snprintf(S.wake_model,sizeof S.wake_model,"%s",selection);
+   else if(sel!=0){fprintf(stderr,"esphomed: wake model selection unavailable, using %s\n",LE_WAKE_MODEL_STOCK_NAME);(void)le_wake_model_select(&S.wake_paths,NULL);}
+  }
+  if(S.wake_model[0]){
+   char folder[400],model[LE_WAKE_MODEL_NAME_MAX];
+   snprintf(folder,sizeof folder,"%s/%s",S.wake_paths.models,S.wake_model);
+   if(le_wake_model_label(folder,S.wake_phrase,sizeof S.wake_phrase,model,sizeof model)<0)S.wake_model[0]=0;
+  }
+  if(!S.wake_model[0]){
+   snprintf(S.wake_model,sizeof S.wake_model,"%s",LE_WAKE_MODEL_STOCK_NAME);
+   snprintf(S.wake_phrase,sizeof S.wake_phrase,"%s",LE_WAKE_MODEL_STOCK_PHRASE);
+  }
+ }
+ int selected=json_get_string_top_level(b,"esphome_active_wake_word",wake,sizeof wake);if(selected<0||json_duplicate_key(b,(size_t)n,"esphome_active_wake_word"))return -1;S.active_wake=selected<=0||!!wake[0];
+ if(selected>0&&wake[0]&&strcmp(wake,S.wake_model)&&config_set_string("esphome_active_wake_word",S.wake_model)<0)fprintf(stderr,"esphomed: wake model mirror could not be saved\n");
  /* Speech text sensors (#398) are off unless the owner sets esphome_speech_text_sensors; turning them off drops what was held. */
  {int speech=0;(void)json_get_bool(b,"esphome_speech_text_sensors",&speech);S.speech_text=speech!=0;if(!S.speech_text){text_set(TEXT_TRANSCRIPT_KEY,"");text_set(TEXT_REPLY_KEY,"");}}
  /* Bluetooth proxy (#496) is experimental and off unless the owner sets esphome_bluetooth_proxy: no advertised feature flags, no subscription, no btd scan. */
@@ -719,13 +851,13 @@ int main(int argc,char **argv){const char *bind_addr="0.0.0.0";unsigned port=605
   return le_esphome_health(argv[2],argv[3],argv[5],(unsigned)p,argv[6],!strcmp(argv[1],"--process-check"))?0:1;
  }
  memset(&S,0,sizeof S);le_ble_proxy_init(&B);S.owner=-1;S.mdns_fd=-1;S.muted=1;S.privacy=-1;S.radio_state=1;S.active_wake=1;S.restore_volume=66;S.turn_limit=120000;S.lux=S.lux_sent=-1;S.led_r=S.led_g=S.led_b=255;S.led_brightness=100;
- S.config_path=getenv("LE_CONFIG_PATH");if(!S.config_path||!S.config_path[0])S.config_path="/etc/libreecho/web-config.json";S.status_path="/run/libreecho/esphome-status.json";S.control_path="/run/libreecho/esphome-control.sock";S.agent_path=LE_ADAPTER_AGENT_SOCK;S.control_fd=-1;S.audio_path="/run/libreecho/audio.sock";S.wake_path="/run/libreecho/wakeword.sock";S.radio_path="/run/libreecho/radio.sock";S.timer_path="/run/libreecho/timer.sock";S.led_path="/run/libreecho/led.sock";S.mdns_path=LE_MDNS_SOCKET;S.bus_path="/run/libreecho-audio/system.pcm";S.privacy_path="/sys/devices/platform/amz_privacy/privacy_state";S.idme_path="/sys/firmware/devicetree/base/idme";
+ S.config_path=getenv("LE_CONFIG_PATH");if(!S.config_path||!S.config_path[0])S.config_path="/etc/libreecho/web-config.json";S.status_path="/run/libreecho/esphome-status.json";S.control_path="/run/libreecho/esphome-control.sock";S.agent_path=LE_ADAPTER_AGENT_SOCK;S.control_fd=-1;S.audio_path="/run/libreecho/audio.sock";S.wake_path="/run/libreecho/wakeword.sock";S.radio_path="/run/libreecho/radio.sock";S.timer_path="/run/libreecho/timer.sock";S.led_path="/run/libreecho/led.sock";S.mdns_path=LE_MDNS_SOCKET;S.bus_path="/run/libreecho-audio/system.pcm";S.privacy_path="/sys/devices/platform/amz_privacy/privacy_state";S.idme_path="/sys/firmware/devicetree/base/idme";S.wake_init_path=WAKE_INIT_DEFAULT;
  for(unsigned i=0;i<CLIENTS;i++)S.clients[i].fd=-1;for(unsigned i=0;i<JOBS;i++)S.jobs[i].fd=-1;S.wake.fd=S.mic.fd=S.timer_cleanup.fd=-1;S.button_fd=-1;esp_playback_init(&S.playback);
  snprintf(S.button_path,sizeof S.button_path,"%s",LE_ADAPTER_BUTTON_EVENT_SOCK);
  for(int i=1;i<argc;i++){const char *v=i+1<argc?argv[i+1]:NULL;if(!strcmp(argv[i],"--plaintext")){S.plaintext=1;continue;}if(!v)return 2;
  if(!strcmp(argv[i],"--port")){char *end;unsigned long p=strtoul(v,&end,10);if(*end||p<1||p>65535)return 2;port=(unsigned)p;}
  else if(!strcmp(argv[i],"--bind")||!strcmp(argv[i],"--listen"))bind_addr=v;else if(!strcmp(argv[i],"--config"))S.config_path=v;else if(!strcmp(argv[i],"--status-file"))S.status_path=v;else if(!strcmp(argv[i],"--control-socket"))S.control_path=v;
- else if(!strcmp(argv[i],"--audio-socket"))S.audio_path=v;else if(!strcmp(argv[i],"--agent-socket"))S.agent_path=v;else if(!strcmp(argv[i],"--wake-socket"))S.wake_path=v;else if(!strcmp(argv[i],"--radio-socket"))S.radio_path=v;else if(!strcmp(argv[i],"--timer-socket"))S.timer_path=v;else if(!strcmp(argv[i],"--led-socket"))S.led_path=v;else if(!strcmp(argv[i],"--mdns-socket"))S.mdns_path=v;else if(!strcmp(argv[i],"--button-socket")){if(strlen(v)>=sizeof S.button_path)return 2;snprintf(S.button_path,sizeof S.button_path,"%s",v);}else if(!strcmp(argv[i],"--audio-bus"))S.bus_path=v;else if(!strcmp(argv[i],"--privacy-state"))S.privacy_path=v;else if(!strcmp(argv[i],"--tls-ca"))S.ca_path=v;else if(!strcmp(argv[i],"--idme-root"))S.idme_path=v;
+ else if(!strcmp(argv[i],"--audio-socket"))S.audio_path=v;else if(!strcmp(argv[i],"--agent-socket"))S.agent_path=v;else if(!strcmp(argv[i],"--wake-socket"))S.wake_path=v;else if(!strcmp(argv[i],"--radio-socket"))S.radio_path=v;else if(!strcmp(argv[i],"--timer-socket"))S.timer_path=v;else if(!strcmp(argv[i],"--led-socket"))S.led_path=v;else if(!strcmp(argv[i],"--mdns-socket"))S.mdns_path=v;else if(!strcmp(argv[i],"--button-socket")){if(strlen(v)>=sizeof S.button_path)return 2;snprintf(S.button_path,sizeof S.button_path,"%s",v);}else if(!strcmp(argv[i],"--audio-bus"))S.bus_path=v;else if(!strcmp(argv[i],"--privacy-state"))S.privacy_path=v;else if(!strcmp(argv[i],"--tls-ca"))S.ca_path=v;else if(!strcmp(argv[i],"--idme-root"))S.idme_path=v;else if(!strcmp(argv[i],"--waked-init"))S.wake_init_path=v;
  else if(!strcmp(argv[i],"--light-sensor")){if(!v[0]||strlen(v)>=sizeof S.light_path)return 2;snprintf(S.light_path,sizeof S.light_path,"%s",v);}
  else if(!strcmp(argv[i],"--name")){if(strlen(v)>=sizeof S.name)return 2;snprintf(S.name,sizeof S.name,"%s",v);}else if(!strcmp(argv[i],"--mac")){if(normalize_mac(v,S.mac))return 2;}
  else if(!strcmp(argv[i],"--turn-timeout-ms")){char *end;unsigned long p=strtoul(v,&end,10);if(*end||p<100||p>120000)return 2;S.turn_limit=p;}else return 2;i++;}
@@ -752,7 +884,7 @@ int main(int argc,char **argv){const char *bind_addr="0.0.0.0";unsigned port=605
  if(S.button_fd>=0&&(fds[1+CLIENTS].revents&POLLIN))button_tick();
  if(S.now>=S.settings_poll+SETTINGS_POLL_MS){S.settings_poll=S.now;(void)job(S.led_path,"status","{}",10,0);(void)job(S.wake_path,"status","{}",11,0);(void)job(S.agent_path,"voice_history_generation","{}",HISTORY_GENERATION_KIND,0);}
  if(S.now>=S.last_status_poll+250){S.last_status_poll=S.now;privacy_poll();light_poll();(void)job(S.audio_path,"status","{}",1,0);(void)job(S.radio_path,"status","{}",2,0);}
- jobs_tick();ble_tick();led_tick();action_ring_tick();level_tick();if(S.now>=S.wake_retry){if(S.wake.fd<0)(void)io_open(&S.wake,S.wake_path,"subscribe","{}",0);if(S.mic.fd<0)(void)io_open(&S.mic,S.wake_path,"stream_audio","{}",0);S.wake_retry=S.now+1000;}
+ jobs_tick();wake_restart_tick();ble_tick();led_tick();action_ring_tick();level_tick();if(S.now>=S.wake_retry){if(S.wake.fd<0)(void)io_open(&S.wake,S.wake_path,"subscribe","{}",0);if(S.mic.fd<0)(void)io_open(&S.mic,S.wake_path,"stream_audio","{}",0);S.wake_retry=S.now+1000;}
  stream_tick(&S.mic,1);stream_tick(&S.wake,0);control_tick();capture_tick();
  if(!S.turn&&S.owner>=0)(void)server_listen_start();
  if(S.turn&&S.now>S.turn_deadline)cancel_turn("timeout");

@@ -11,6 +11,30 @@ def text(f,v):
  if isinstance(v,str):v=v.encode()
  return var((f<<3)|2)+var(len(v))+v
 def frame(t,b=b''):return b'\0'+var(len(b))+var(t)+b
+# Minimal ONNX protobuf writer, matching tests/test_wake_model.c: the daemon
+# validates graph names/opsets, not tensor shapes, so these fixtures pass the
+# same contract a staged folder must pass.
+def pb_varint(v):
+ out=bytearray()
+ while v>127:out.append((v&127)|128);v>>=7
+ out.append(v);return bytes(out)
+def pb_tag(field,wire):return pb_varint((field<<3)|wire)
+def pb_len(field,body):return pb_tag(field,2)+pb_varint(len(body))+body
+def pb_str(field,value):return pb_len(field,value.encode())
+def pb_uint(field,value):return pb_tag(field,0)+pb_varint(value)
+def onnx_model(inp,out,ops):
+ graph=b''
+ for i,op in enumerate(ops):
+  node=pb_str(1,inp)+pb_str(2,out if i==len(ops)-1 else f't{i}')+pb_str(4,op)
+  graph+=pb_len(1,node)
+ graph+=pb_len(11,pb_str(1,inp))+pb_len(12,pb_str(1,out))
+ return pb_len(8,pb_uint(2,13))+pb_len(7,graph)+pb_len(6,b'x'*1100)
+def write_staged_wake_model(root,name):
+ d=root/'wakeword-models'/name;d.mkdir(parents=True,exist_ok=True)
+ (d/'melspectrogram.onnx').write_bytes(onnx_model('input','output',['Mel']))
+ (d/'embedding_model.onnx').write_bytes(onnx_model('input_1','conv2d_19',['Conv']))
+ (d/'alexa_v0.1.onnx').write_bytes(onnx_model('onnx::Flatten_0','13',['Flatten','Gemm','Relu','Sigmoid']))
+ return d
 def recvvar(s):
  v=0
  for i in range(5):
@@ -166,7 +190,7 @@ class Fixture(Daemon):
   self.s.sendall(frame(115,num(1,0)+text(2,'fixture-timer')+text(3,'tea')+num(4,60)+num(5,45)+num(6,1)))
   self.assertEqual(self.wait_call('timer','remote_event')['args'],{'event_type':0,'timer_id':'fixture-timer','name':'tea','total_seconds':60,'seconds_left':45,'is_active':True})
   self.s.sendall(frame(121));self.assertEqual(receive(self.s)[0],122);self.s.sendall(frame(123,text(1,'alexa_v0.1')));self.assertEqual(receive(self.s)[0],122)
-  self.assertEqual(self.wait_call('wake','set_word')['args'],{'word':'Alexa'});self.assertEqual(json.loads(self.config.read_text())['esphome_active_wake_word'],'alexa_v0.1')
+  self.assertEqual(json.loads(self.config.read_text())['esphome_active_wake_word'],'alexa_v0.1');self.assertFalse(any(r['cmd']=='set_word' for r in self.adapters['wake'].calls),'selection restarts the wake service instead of reloading its word')
  def test_owner_overlap_error_cleanup_and_negative_announcement(self):
   self.hello();self.s.sendall(frame(89,num(1,1)+num(2,4)));time.sleep(.05)
   other=self.connect();other.sendall(frame(1));self.assertEqual(receive(other)[0],2);other.sendall(frame(89,num(1,1)+num(2,4)));self.assertEqual(other.recv(1),b'')
@@ -312,8 +336,28 @@ class Fixture(Daemon):
   saved=json.loads(self.config.read_text());self.assertEqual(saved.get('esphome_active_wake_word'),'');self.assertEqual(saved['wake_word'],'Local saved word');self.proc.send_signal(signal.SIGHUP);time.sleep(.1)
   self.s=self.connect();self.hello();self.s.sendall(frame(121));t,b=receive(self.s);self.assertEqual(t,122);self.assertNotIn(text(2,'alexa_v0.1'),b)
   a=self.adapters['wake'];a.wait_streams();a.samples(0);a.wake(100);self.s.sendall(frame(7));self.assertEqual(receive(self.s),(8,b''))
-  self.s.sendall(frame(123,text(1,'alexa_v0.1')));self.assertEqual(receive(self.s)[0],122);self.assertEqual(self.wait_call('wake','set_word')['args'],{'word':'Alexa'});self.assertEqual(json.loads(self.config.read_text())['esphome_active_wake_word'],'alexa_v0.1');self.assertEqual(json.loads(self.config.read_text())['wake_word'],'Local saved word')
- def test_finite_chunked_wav_decodes_before_completion(self):
+  self.s.sendall(frame(123,text(1,'alexa_v0.1')));self.assertEqual(receive(self.s)[0],122);self.assertFalse(any(r['cmd']=='set_word' for r in self.adapters['wake'].calls));self.assertEqual(json.loads(self.config.read_text())['esphome_active_wake_word'],'alexa_v0.1');self.assertEqual(json.loads(self.config.read_text())['wake_word'],'Local saved word')
+ def test_wake_models_list_phrases_and_apply_selection(self):
+  write_staged_wake_model(self.p,'ok_nabu');write_staged_wake_model(self.p,'hey_jarvis')
+  self.hello();self.s.sendall(frame(121));t,b=receive(self.s);self.assertEqual(t,122)
+  self.assertIn(text(1,'alexa_v0.1'),b);self.assertIn(text(2,'Alexa'),b)
+  self.assertIn(text(1,'ok_nabu'),b);self.assertIn(text(2,'Ok Nabu'),b)
+  self.assertIn(text(1,'hey_jarvis'),b);self.assertIn(text(2,'Hey Jarvis'),b)
+  self.s.sendall(frame(123,text(1,'ok_nabu')));self.assertEqual(receive(self.s)[0],122)
+  self.assertEqual(json.loads(self.config.read_text())['esphome_active_wake_word'],'ok_nabu')
+  self.assertEqual((self.p/'wake-model').read_text().strip(),'ok_nabu')
+  self.s.sendall(frame(121));t,b=receive(self.s);self.assertIn(text(2,'ok_nabu'),b)
+  self.assertFalse(any(r['cmd']=='set_word' for r in self.adapters['wake'].calls),'a model change restarts the wake service instead of reloading its word')
+def test_unknown_wake_model_id_closes_the_client(self):
+  self.hello();self.s.sendall(frame(123,text(1,'no_such_model')));self.assertEqual(self.s.recv(1),b'')
+def test_vanished_selected_model_falls_back_to_stock(self):
+  import signal,shutil
+  folder=write_staged_wake_model(self.p,'ok_nabu');self.hello();self.s.sendall(frame(123,text(1,'ok_nabu')));self.assertEqual(receive(self.s)[0],122)
+  self.assertEqual((self.p/'wake-model').read_text().strip(),'ok_nabu')
+  shutil.rmtree(folder);self.proc.send_signal(signal.SIGHUP);time.sleep(.3);self.s=self.connect();self.hello();self.s.sendall(frame(121));t,b=receive(self.s);self.assertEqual(t,122)
+  self.assertIn(text(2,'alexa_v0.1'),b);self.assertFalse((self.p/'wake-model').exists(),'a vanished selection file is dropped')
+  self.assertEqual(json.loads(self.config.read_text())['esphome_active_wake_word'],'alexa_v0.1')
+def test_finite_chunked_wav_decodes_before_completion(self):
   wav=io.BytesIO()
   with wave.open(wav,'wb') as w:w.setnchannels(1);w.setsampwidth(2);w.setframerate(48000);w.writeframes(struct.pack('<h',1700)*1000)
   data=wav.getvalue()

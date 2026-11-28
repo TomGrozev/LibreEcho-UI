@@ -12,7 +12,7 @@
 PAYLOAD=${PAYLOAD:-/data/libreecho/features/wakeword/payload.squashfs}
 RUNTIME_ROOT=${RUNTIME_ROOT:-/run/libreecho/features/wakeword/root}
 DAEMON=${DAEMON:-$RUNTIME_ROOT/usr/local/sbin/libreecho-waked}
-MODEL_ROOT=${MODEL_ROOT:-$RUNTIME_ROOT/usr/local/share/libreecho/openwakeword}
+MODEL_ROOT=${MODEL_ROOT:-$RUNTIME_ROOT/usr/local/share/libreecho/wakeword}
 PIDFILE=${PIDFILE:-/var/run/libreecho-waked.pid}
 LOGFILE=${LOGFILE:-/var/log/libreecho-waked.log}
 SOCKET=${SOCKET:-/run/libreecho/wakeword.sock}
@@ -38,24 +38,30 @@ AEC_FILE=${AEC_FILE:-/data/libreecho/config/aec-reference}
 # a longer outage.
 DUMP_FILE=${DUMP_FILE:-/data/libreecho/config/wake-dump-seconds}
 DUMP_MAX_SECONDS=${DUMP_MAX_SECONDS:-20}
-# Owner-staged openWakeWord models. Write a model name to $WAKE_MODEL_FILE to
+# Owner-staged microWakeWord models. Write a model name to $WAKE_MODEL_FILE to
 # run the stock, signed detector against $WAKE_MODEL_BASE/<name>/ instead of
-# the models in the feature payload. The directory must hold the same three
-# files the payload does (melspectrogram.onnx, embedding_model.onnx and the
-# classifier as alexa_v0.1.onnx). Only a model is selectable: the detector
-# executable always comes from the signed payload, nothing under /data is
-# executed, and any problem falls back to the stock model so a bad selection
-# never costs the device its wake word. Remove the file to return to stock.
+# the bundled words. The directory must hold exactly <name>.tflite and
+# <name>.json, the manifest and model pair the web control centre stages; the
+# shared VAD model is copied from the feature payload's vad folder into
+# $WAKE_MODEL_BASE/vad the first time an owner model runs. Only a model is
+# selectable: the detector executable always comes from the signed payload,
+# nothing under /data is executed, and any problem falls back to the stock
+# model so a bad selection never costs the device its wake word. Remove the
+# file to return to stock.
 WAKE_MODEL_FILE=${WAKE_MODEL_FILE:-/data/libreecho/config/wake-model}
 WAKE_MODEL_BASE=${WAKE_MODEL_BASE:-/data/libreecho/wakeword-models}
 # Optional second wake word. Write an owner-staged model folder name to
-# $WAKE_SECOND_FILE: waked then also listens for that word, running its
-# classifier on the first model's features, and reports detections under the
-# folder name. Only the folder's alexa_v0.1.onnx is used. Off when the file is
-# absent; a bad or incomplete name is ignored with a note.
+# $WAKE_SECOND_FILE: waked then also listens for that word and reports
+# detections under the manifest's wake_word. Only the folder's <name>.tflite
+# and <name>.json are used. Off when the file is absent; a bad or incomplete
+# name is ignored with a note.
 WAKE_SECOND_FILE=${WAKE_SECOND_FILE:-/data/libreecho/config/wake-second}
 # How long a custom model gets to prove it loads before falling back.
 WAKE_MODEL_SETTLE_SECONDS=${WAKE_MODEL_SETTLE_SECONDS:-3}
+# A waked restart must bounce micd too: waked is micd's only stream consumer
+# and micd offers the stream once, so a waked restarted alone fails with a
+# protocol error. MICD_INIT is overridable for tests and odd images.
+MICD_INIT=${MICD_INIT:-/etc/init.d/libreecho-micd.init}
 VAD_FLOOR_DEFAULT=16
 # Must not exceed what the waked binary accepts, or it exits at startup and
 # the device comes back with no wake word. That binary ships inside the wake
@@ -133,9 +139,33 @@ model_note() {
     mkdir -p "$(dirname "$LOGFILE")" && echo "libreecho-waked: $*" >>"$LOGFILE" || true
 }
 
+# $1 is the word folder, $2 its folder name: the pair must be exactly
+# <name>.tflite and <name>.json, both real non-empty files.
 model_files_present() {
-    for model in melspectrogram.onnx embedding_model.onnx alexa_v0.1.onnx; do
-        [ -f "$1/$model" ] && [ ! -L "$1/$model" ] && [ -s "$1/$model" ] || return 1
+    for suffix in tflite json; do
+        file=$1/$2.$suffix
+        [ -f "$file" ] && [ ! -L "$file" ] && [ -s "$file" ] || return 1
+    done
+}
+
+# The bundled VAD model is shared by every word folder, which all live under
+# $WAKE_MODEL_BASE. Seed it there from the signed payload before an owner model
+# starts, and refresh a partial copy; a failure means the caller falls back to
+# the stock word rather than starting a detector without voice activity
+# detection.
+ensure_owner_vad() {
+    source_dir=$BUNDLED_MODEL_ROOT/vad
+    target_dir=$WAKE_MODEL_BASE/vad
+    for suffix in tflite json; do
+        [ -f "$source_dir/vad.$suffix" ] || return 1
+    done
+    if [ -f "$target_dir/vad.tflite" ] && [ -f "$target_dir/vad.json" ] &&
+       [ ! -L "$target_dir/vad.tflite" ] && [ ! -L "$target_dir/vad.json" ]; then
+        return 0
+    fi
+    mkdir -p "$target_dir" || return 1
+    for suffix in tflite json; do
+        cp "$source_dir/vad.$suffix" "$target_dir/vad.$suffix" || return 1
     done
 }
 
@@ -150,7 +180,7 @@ custom_model_root() {
             ;;
     esac
     dir=$WAKE_MODEL_BASE/$name
-    if [ -L "$dir" ] || [ ! -d "$dir" ] || ! model_files_present "$dir"; then
+    if [ -L "$dir" ] || [ ! -d "$dir" ] || ! model_files_present "$dir" "$name"; then
         model_note "model '$name' is incomplete in $WAKE_MODEL_BASE; using stock model"
         return 0
     fi
@@ -167,8 +197,8 @@ second_model_root() {
             ;;
     esac
     dir=$WAKE_MODEL_BASE/$name
-    if [ -L "$dir/alexa_v0.1.onnx" ] || [ ! -f "$dir/alexa_v0.1.onnx" ]; then
-        model_note "second wake word '$name' has no classifier in $WAKE_MODEL_BASE; ignoring it"
+    if [ -L "$dir" ] || [ ! -d "$dir" ] || ! model_files_present "$dir" "$name"; then
+        model_note "second wake word '$name' has no model in $WAKE_MODEL_BASE; ignoring it"
         return 0
     fi
     printf '%s\n' "$dir"
@@ -188,10 +218,10 @@ start_service() {
     mount_runtime || return 1
     # The stock model is checked even when a custom one is selected: it is
     # what the device falls back to.
+    BUNDLED_MODEL_ROOT=$MODEL_ROOT
     [ -x "$DAEMON" ] &&
-        [ -f "$MODEL_ROOT/melspectrogram.onnx" ] &&
-        [ -f "$MODEL_ROOT/embedding_model.onnx" ] &&
-        [ -f "$MODEL_ROOT/alexa_v0.1.onnx" ] || {
+        model_files_present "$BUNDLED_MODEL_ROOT/alexa" alexa &&
+        model_files_present "$BUNDLED_MODEL_ROOT/vad" vad || {
         echo "libreecho-waked: incomplete wakeword runtime" >&2
         unmount_runtime
         return 1
@@ -248,17 +278,27 @@ start_service() {
                fi ;;
         esac
     fi
-    STOCK_MODEL_ROOT=$MODEL_ROOT
+    STOCK_MODEL_ROOT=$BUNDLED_MODEL_ROOT/alexa
+    MODEL_ROOT=$STOCK_MODEL_ROOT
     SELECTED_MODEL_ROOT=$(custom_model_root)
     if [ -n "$SELECTED_MODEL_ROOT" ]; then
-        MODEL_ROOT=$SELECTED_MODEL_ROOT
-        model_note "using owner-staged model $MODEL_ROOT"
+        if ensure_owner_vad; then
+            MODEL_ROOT=$SELECTED_MODEL_ROOT
+            model_note "using owner-staged model $MODEL_ROOT"
+        else
+            model_note "shared VAD model missing from $BUNDLED_MODEL_ROOT/vad; using stock model"
+            SELECTED_MODEL_ROOT=
+        fi
     fi
     SECOND_ARG=""
     SECOND_MODEL_ROOT=$(second_model_root)
     if [ -n "$SECOND_MODEL_ROOT" ]; then
-        SECOND_ARG="--second-model-dir $SECOND_MODEL_ROOT"
-        model_note "listening for a second wake word from $SECOND_MODEL_ROOT"
+        if ensure_owner_vad; then
+            SECOND_ARG="--second-model-dir $SECOND_MODEL_ROOT"
+            model_note "listening for a second wake word from $SECOND_MODEL_ROOT"
+        else
+            model_note "shared VAD model missing from the feature payload; ignoring the second wake word"
+        fi
     fi
     ARGS=${ARGS:---foreground --socket $SOCKET --mic-socket $MIC_SOCKET $AEC_REFERENCE_ARG --model-dir $MODEL_ROOT --wake-threads 1 --vad-floor-rms $VAD_FLOOR_RMS $DUMP_ARG $SECOND_ARG}
     launch_daemon
@@ -335,7 +375,19 @@ stop_service() {
 case "${1:-}" in
     start) start_service ;;
     stop) stop_service ;;
-    restart) stop_service; start_service ;;
+    restart)
+        # Stop waked before micd so micd's only stream consumer disappears
+        # while it is down, then start micd before waked so the new waked
+        # finds a stream offer waiting.
+        stop_service
+        if [ -x "$MICD_INIT" ]; then
+            "$MICD_INIT" stop
+            "$MICD_INIT" start
+        else
+            model_note "micd init script missing at $MICD_INIT; restarting waked alone"
+        fi
+        start_service
+        ;;
     status) if is_running; then echo "running"; else echo "stopped"; exit 1; fi ;;
     *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
 esac

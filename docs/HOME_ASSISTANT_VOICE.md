@@ -5,7 +5,7 @@ Home Assistant owns the STT, conversation/intent and TTS pipeline after wake:
 
 ```text
 Echo microphones -> calibration / AEC / beam selection
-                 -> local openWakeWord
+                 -> local microWakeWord
                  -> ESPHome native API (Noise, TCP 6053)
                  -> Home Assistant Assist
                     -> selected STT / conversation agent / TTS
@@ -242,13 +242,18 @@ an unrelated listener reports false. Audio/capture readiness remains separately
 gated by adapter and privacy state; neither field probes dormant Custom
 Whisper/Piper endpoints in HA mode.
 
-Native wake selection is persisted independently as `esphome_active_wake_word`
-(default Alexa, empty disabled, or `alexa_v0.1`) and survives ordinary config
-saves without replacing Local/Custom wake settings. Validated `set_word` reloads
-the existing inference worker with a bounded five-second wait; the satellite
-allows six seconds for that transaction while ordinary adapter deadlines stay
-at 500 ms. Host lifecycle tests script only ONNX compute; trained-model quality
-and hardware capture through reload remain separate acceptance gates.
+Native wake selection is persisted independently and survives ordinary config
+saves without replacing Local/Custom wake settings. `esphome_active_wake_word`
+mirrors the selection file (`/data/libreecho/config/wake-model`): the stock
+`alexa`, an owner-staged folder name, or empty for disabled. The Home
+Assistant voice configuration lists the stock model plus every valid staged
+model with a derived phrase ("Ok Nabu" for `ok_nabu`); selecting a listed id or
+an empty list writes the same selection file the web UI uses and restarts the
+wake service, which bounces `micd` as well because it holds waked's only stream
+offer. Unknown ids close the session rather than silently keeping the old word.
+A staged model that disappears falls back to the stock model. Host lifecycle
+tests script only engine compute; trained-model quality and hardware capture
+through reload remain separate acceptance gates.
 
 ## Transitions and failures
 

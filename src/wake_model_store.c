@@ -16,19 +16,26 @@
 
 #define STAGING_DIRECTORY ".staging"
 
-static int known_file(const char *file)
-{
-    size_t i;
-
-    for (i = 0; i < LE_WAKE_MODEL_FILE_COUNT; ++i)
-        if (!strcmp(file, le_wake_model_files[i]))
-            return 1;
-    return 0;
-}
+/* The folder that holds the bundled VAD model shares the model root but is
+ * not a selectable wake word. */
+#define VAD_FOLDER_NAME "vad"
 
 static int reserved_name(const char *name)
 {
-    return !strcmp(name, LE_WAKE_MODEL_STOCK_NAME);
+    return !strcmp(name, LE_WAKE_MODEL_STOCK_NAME) || !strcmp(name, VAD_FOLDER_NAME);
+}
+
+/* Builds "<folder>/<name><suffix>"; returns the number of bytes written or -1. */
+static int model_file_path(char *out, size_t size, const char *folder,
+                           const char *name, int index)
+{
+    char file[LE_WAKE_MODEL_NAME_MAX + 8];
+    int n;
+
+    if (le_wake_model_file_name(name, index, file, sizeof(file)) < 0)
+        return -1;
+    n = snprintf(out, size, "%s/%s", folder, file);
+    return n > 0 && (size_t)n < size ? n : -1;
 }
 
 /* Copies path without its last component. Returns 0 or -1. */
@@ -149,8 +156,7 @@ int le_wake_model_scan(const struct le_wake_model_paths *paths,
         snprintf(item.name, sizeof(item.name), "%.*s", (int)(sizeof(item.name) - 1), entry->d_name);
         item.valid = le_wake_model_validate_directory(folder, item.reason, sizeof(item.reason)) == 0;
         for (i = 0; i < LE_WAKE_MODEL_FILE_COUNT; ++i) {
-            if (snprintf(file, sizeof(file), "%s/%s", folder, le_wake_model_files[i]) <
-                (int)sizeof(file))
+            if (model_file_path(file, sizeof(file), folder, entry->d_name, (int)i) > 0)
                 item.bytes += file_bytes(file);
         }
         item.selected = have_selection && !strcmp(selected, item.name);
@@ -176,8 +182,7 @@ static void remove_staged(const struct le_wake_model_paths *paths, const char *n
     if (snprintf(folder, sizeof(folder), "%s/%s", paths->staging, name) >= (int)sizeof(folder))
         return;
     for (i = 0; i < LE_WAKE_MODEL_FILE_COUNT; ++i) {
-        if (snprintf(file, sizeof(file), "%s/%s", folder, le_wake_model_files[i]) <
-            (int)sizeof(file))
+        if (model_file_path(file, sizeof(file), folder, name, (int)i) > 0)
             unlink(file);
     }
     rmdir(folder);
@@ -196,7 +201,8 @@ int le_wake_model_stage_chunk(const struct le_wake_model_paths *paths, const cha
 
     if (!paths || !name || !file || !data || !staged_bytes)
         return LE_WAKE_MODEL_STORE_INVALID;
-    if (!le_wake_model_name_valid(name) || reserved_name(name) || !known_file(file))
+    if (!le_wake_model_name_valid(name) || reserved_name(name) ||
+        !le_wake_model_file_known(name, file))
         return LE_WAKE_MODEL_STORE_INVALID;
     if (length == 0 || length > LE_WAKE_MODEL_STAGE_CHUNK_MAX ||
         offset > LE_WAKE_MODEL_MAX_BYTES || length > LE_WAKE_MODEL_MAX_BYTES - offset)
@@ -324,8 +330,8 @@ int le_wake_model_delete(const struct le_wake_model_paths *paths, const char *na
     if (lstat(folder, &st) < 0 || !S_ISDIR(st.st_mode))
         return LE_WAKE_MODEL_STORE_NOT_FOUND;
     for (i = 0; i < LE_WAKE_MODEL_FILE_COUNT; ++i) {
-        if (snprintf(file, sizeof(file), "%s/%s", folder, le_wake_model_files[i]) <
-            (int)sizeof(file) && unlink(file) < 0 && errno != ENOENT)
+        if (model_file_path(file, sizeof(file), folder, name, (int)i) > 0 &&
+            unlink(file) < 0 && errno != ENOENT)
             return LE_WAKE_MODEL_STORE_IO;
     }
     return rmdir(folder) < 0 ? LE_WAKE_MODEL_STORE_IO : LE_WAKE_MODEL_STORE_OK;

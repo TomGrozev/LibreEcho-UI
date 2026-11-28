@@ -57,9 +57,9 @@ class SatelliteShipping(unittest.TestCase):
             rule = makefile.split("\n$(BUILD)/" + target + ":", 1)[1].split("\n\n", 1)[0]
             self.assertIn("src/json.c", rule)
             self.assertIn("src/adapter/adapter_server.c", rule)
-        self.assertIn("$(BUILD)/json.wake.arm.o: src/json.c", makefile)
-        objects = makefile.split("WAKE_DAEMON_ARM_OBJECTS =", 1)[1].split("\n\n", 1)[0]
-        self.assertIn("$(BUILD)/json.wake.arm.o", objects)
+        self.assertIn("$(BUILD)/json.mww.arm.o: src/json.c", makefile)
+        objects = makefile.split("WAKE_DAEMON_MWW_ARM_OBJECTS =", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("$(BUILD)/json.mww.arm.o", objects)
 
 
 if __name__ == "__main__":

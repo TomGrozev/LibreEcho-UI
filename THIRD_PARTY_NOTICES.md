@@ -96,8 +96,8 @@ build, but are not vendored as source in this repository's current `main` tree:
 
 - **SpeexDSP** — optional host/runtime dependency for AEC and resampling. Use
   the license and notices supplied by the installed or packaged SpeexDSP copy.
-- **sherpa-onnx and ONNX Runtime** — optional ARM32 inference build inputs for
-  the real STT/TTS/wake-word targets. Their source, binary, model, and license
+- **sherpa-onnx and ONNX Runtime** (optional ARM32 inference build inputs for
+  the real STT/TTS targets). Their source, binary, model, and license
   obligations belong to the corresponding build/image release boundary.
 - **Wyoming services/protocol** — an external integration used by custom and
   Home Assistant speech modes. See the links in

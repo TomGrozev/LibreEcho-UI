@@ -5236,7 +5236,7 @@
         "Wake word"
       ],
       "summary": "Select a wake model",
-      "description": "Selects a committed model folder, or the stock model with alexa_v0.1. The choice is saved on the device and applies when the wake service next starts.",
+      "description": "Selects a committed model folder by folder name, or the stock model with alexa. The choice is saved on the device and applies when the wake service next starts.",
       "parameters": [
         {
           "$ref": "#/components/parameters/Csrf"
@@ -5323,7 +5323,7 @@
         "Wake word"
       ],
       "summary": "Upload one chunk of a model file",
-      "description": "Stages one base64 chunk of melspectrogram.onnx, embedding_model.onnx or alexa_v0.1.onnx. offset must equal the bytes already staged for that file; offset 0 starts the file again. A chunk decodes to at most 8192 bytes; a file is at most 8 MiB.",
+      "description": "Stages one base64 chunk of the model's manifest or model file: <name>.json and <name>.tflite, the two files the folder must hold. offset must equal the bytes already staged for that file; offset 0 starts the file again. A chunk decodes to at most 8192 bytes; a model file is at most 8 MiB and the manifest at most 64 KiB.",
       "parameters": [
         {
           "$ref": "#/components/parameters/Csrf"
@@ -5343,11 +5343,8 @@
           "required": true,
           "schema": {
             "type": "string",
-            "enum": [
-              "melspectrogram.onnx",
-              "embedding_model.onnx",
-              "alexa_v0.1.onnx"
-            ]
+            "description": "<name>.json or <name>.tflite, where name is the folder name",
+            "pattern": "^[A-Za-z0-9._-]+\\.(json|tflite)$"
           }
         }
       ],
@@ -5397,7 +5394,7 @@
         "Wake word"
       ],
       "summary": "Check and install a staged wake model",
-      "description": "Checks the three staged files (names, sizes, graph inputs and outputs, operators, opset and external data) and moves the folder into place. A folder that fails the check is discarded and the response carries the reason.",
+      "description": "Checks the two staged files (names and sizes, the manifest's type/version/wake_word/model/cutoff/window/step/arena fields, and the model's single subgraph, int8 [1, N, 40] input, uint8 [1, 1] output and allowed operators) and moves the folder into place. A folder holding any other file is rejected. A folder that fails the check is discarded and the response carries the reason.",
       "parameters": [
         {
           "$ref": "#/components/parameters/Csrf"

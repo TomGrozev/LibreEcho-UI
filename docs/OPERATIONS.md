@@ -105,7 +105,7 @@ All services read from `/etc/libreecho/config.json`:
   },
   "wake_word": {
     "enabled": true,
-    "sensitivity": 68
+    "sensitivity": 50
   },
   "privacy": {
     "local_only": true,
@@ -121,20 +121,28 @@ Each service reads its section at startup. To change:
 1. Edit `/etc/libreecho/config.json` (or use web UI)
 2. Reload: `killall -HUP libreecho-networkd libreecho-audiod libreecho-ledd libreecho-web`
 
-### Wake Word Model and Threshold
+### Wake Word Model and Sensitivity
 
 These persist in `/data`, so they survive reboot and OTA.
 
-- **Threshold**: set `wake_sensitivity` (0-100) in the web UI or with
-  `PUT /api/v1/wake-word`. It is saved and reapplied at every boot, and maps
-  to a detector threshold of `0.85 - 0.0044 * sensitivity` (0.85 at 0,
-  0.41 at 100).
-- **Owner-staged model**: put a model in `/data/libreecho/wakeword-models/<name>/`
-  holding `melspectrogram.onnx`, `embedding_model.onnx` and the classifier
-  named `alexa_v0.1.onnx` (regular files, not symlinks), then write `<name>` to
-  `/data/libreecho/config/wake-model` and run
+- **Sensitivity**: set `wake_sensitivity` (0-100) in the web UI or with
+  `PUT /api/v1/wake-word`. It is saved and reapplied at every boot. Each word
+  keeps the probability cutoff its model was trained with in its manifest
+  (`micro.probability_cutoff`), and sensitivity moves that cutoff:
+  `cutoff + (50 - sensitivity) * 0.004`, clamped to 0.01-0.99. 50 runs the
+  trained cutoff unchanged, 100 is 0.2 lower (more sensitive), 0 is 0.2
+  higher. A wake needs the word's sliding-window mean to reach the cutoff
+  and the shared vad model's window mean to reach 0.5; after a wake the word
+  is ignored for one second and until its mean falls below the cutoff.
+- **Owner-staged model**: put a microWakeWord folder in
+  `/data/libreecho/wakeword-models/<name>/` holding exactly `<name>.tflite`
+  and `<name>.json` (the manifest; regular files, not symlinks), then write
+  `<name>` to `/data/libreecho/config/wake-model` and run
   `/etc/init.d/libreecho-waked.init restart`. Names may use only letters,
-  digits, `.`, `_` and `-`, and may not start with `.`.
+  digits, `.`, `_` and `-`, and may not start with `.`; `alexa` and `vad` are
+  reserved. The init script copies the bundled `vad` folder to
+  `/data/libreecho/wakeword-models/vad/` before the first owner model starts.
+  The web upload endpoint stages and checks the pair for you.
   Only the model is replaceable. The detector is always the signed one from
   the wakeword feature payload; nothing under `/data` is executed. An invalid
   or incomplete selection, or a model the detector cannot load, falls back to
