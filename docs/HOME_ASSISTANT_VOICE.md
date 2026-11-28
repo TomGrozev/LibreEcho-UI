@@ -205,12 +205,13 @@ before it resumes, giving one pause instead of a stutter. If no data arrives for
 3 s after the reply started, typically TCP backing off after the Wi-Fi dropped
 frames, the device opens a new connection to the same URL. Home Assistant
 serves the stream again from its cache, so the device skips the bytes it
-already has. A replay that starts with different bytes, or ends before them, fails. From the end of speech until the first audio, and whenever the stream
-stalls between sentences, the device feeds the speaker silence. This hides the
+already has. A replay that starts with different bytes, or ends before them, fails. From the start of a turn, the device feeds the speaker silence. This hides the
 audio output's power-up behind STT and the agent, and keeps the output from
-shutting down mid-reply. Media is ducked from the end of speech, as it is
-during the reply. A reply fails if no data arrives
-for 20 s, or if it runs past 180 s or 32 MiB.
+shutting down mid-reply. When music is playing, the same silence keeps the
+engine's media duck engaged from the wake (on-device or Home Assistant's
+server-side wake) through listening, the agent, the reply and any continued
+listening, and it is released when the turn ends by any path. A reply fails if
+no data arrives for 20 s, or if it runs past 180 s or 32 MiB.
 
 These protocol contracts are host-verification targets, not a claim that this
 image has been deployed or acoustically tested. Protocol/framing, audio and

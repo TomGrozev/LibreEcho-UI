@@ -82,7 +82,7 @@ class Daemon(unittest.TestCase):
   self.assertTrue(os.access(BIN,os.X_OK), 'daemon executable is missing')
   self.tmp=tempfile.TemporaryDirectory(prefix='esphomed-',dir=os.environ.get('TMPDIR'));self.p=pathlib.Path(self.tmp.name)
   self.config=self.p/'config.json';self.config.write_text(json.dumps(getattr(self,'config_fields',{'hostname':'fixture-satellite','wifi_mac':'02:00:00:00:00:01','ha_protocol':'esphome','voice_assistant_mode':1,'esphome_noise_key':''})))
-  self.privacy=self.p/'privacy';self.privacy.write_text('0\n');self.bus=self.p/'system.pcm';os.mkfifo(self.bus);self.busfd=os.open(self.bus,os.O_RDONLY|os.O_NONBLOCK);self.busbytes=bytearray()
+  self.privacy=self.p/'privacy';self.privacy.write_text('0\n');self.audio_dir=self.p/(getattr(self,'audio_subdir',''));self.audio_dir.mkdir(exist_ok=True);self.bus=self.audio_dir/'system.pcm';os.mkfifo(self.bus);self.busfd=os.open(self.bus,os.O_RDONLY|os.O_NONBLOCK);self.busbytes=bytearray()
   self.adapters={k:Adapter(self.p/(k+'.sock'),k) for k in ('audio','wake','radio','timer','led','agent')}
   s=socket.socket();s.bind(('127.0.0.1',0));self.port=s.getsockname()[1];s.close();self.clients=[]
   cmd=[BIN,'--port',str(self.port),'--bind','127.0.0.1']+(['--plaintext'] if getattr(self,'plaintext',True) else [])+['--config',str(self.config),'--status-file',str(self.p/'status.json'),'--privacy-state',str(self.privacy),'--audio-bus',str(self.bus),'--mdns-socket',str(self.p/'missing-mdns')]
@@ -532,4 +532,68 @@ class ServerWakeDefaultOff(Daemon):
   time.sleep(.3);self.s.settimeout(.3)
   with self.assertRaises(TimeoutError):receive(self.s)
   a.wake(4000);self.s.settimeout(3);t,b=receive(self.s);self.assertEqual(t,90);self.assertIn(num(1,1),b);self.assertNotIn(num(3,3),b)
+# Media duck across an HA voice turn. The production engine republishes
+# <bus root>/status.json on every bus-state change; these fixtures stand in for
+# the engine, and the bus FIFO shows whether esphomed feeds the system bus.
+def media_status(playing):
+ # Byte-for-byte the engine's document (playback_status.c) for the media bus
+ # alone: "active" is a bus name, so a naive substring lookup for "media"
+ # would read its value instead of the buses.media flag.
+ return ('{"state":"%s","active":%s,"buses":{"media":%s,"system":false,'
+  '"announcement":false,"alarm":false}}\n' % ('playing' if playing else 'idle',
+  '"media"' if playing else 'null','true' if playing else 'false'))
+class DuckCase(Daemon):
+ audio_subdir='audio'
+ config_fields=API_HA_CONFIG
+ def setUp(self):
+  super().setUp();(self.audio_dir/'status.json').write_text(media_status(True))
+ def drain(self):
+  got=0
+  while True:
+   try:b=os.read(self.busfd,65536)
+   except BlockingIOError:return got
+   if not b:return got
+   self.busbytes+=b;got+=len(b)
+ def feed_started(self,seconds=2):
+  end=time.monotonic()+seconds
+  while time.monotonic()<end:
+   self.drain()
+   if self.busbytes:return True
+   time.sleep(.01)
+  return False
+ def open_turn(self):
+  self.hello();self.s.sendall(frame(89,num(1,1)+num(2,4)));self.adapters['wake'].wait_streams()
+  for i in range(0,6400,320):self.adapters['wake'].samples(i)
+  time.sleep(.1);self.adapters['wake'].wake(4000);self.assertEqual(receive(self.s)[0],90)
+class DuckOnWake(DuckCase):
+ def test_wake_during_media_feeds_the_system_bus(self):
+  self.open_turn()
+  self.assertTrue(self.feed_started(),'wake during media playback must duck before the reply')
+class DuckIdle(Daemon):
+ def test_wake_without_media_feeds_nothing(self):
+  self.hello();self.s.sendall(frame(89,num(1,1)+num(2,4)));self.adapters['wake'].wait_streams()
+  for i in range(0,6400,320):self.adapters['wake'].samples(i)
+  time.sleep(.1);self.adapters['wake'].wake(4000);self.assertEqual(receive(self.s)[0],90)
+  time.sleep(.3)
+  try:b=os.read(self.busfd,65536)
+  except BlockingIOError:b=b''
+  self.assertEqual(b,b'','a turn with no media must not power the output early')
+class DuckReleasesOnError(DuckCase):
+ def test_failed_turn_stops_the_feed(self):
+  self.open_turn()
+  self.assertTrue(self.feed_started(),'duck must be engaged before the failure')
+  self.s.sendall(frame(92,num(1,0)))
+  time.sleep(.3);self.drain();self.busbytes=bytearray()
+  time.sleep(.3);self.drain()
+  self.assertEqual(self.busbytes,bytearray(),'a failed turn must release the duck')
+class DuckServerWakeStartsOnHaWake(DuckCase):
+ config_fields=dict(SERVER_WAKE_CONFIG)
+ def test_continuous_stream_is_quiet_until_ha_reports_wake(self):
+  self.hello();self.s.sendall(frame(89,num(1,1)+num(2,4)));self.adapters['wake'].wait_streams()
+  for i in range(0,6400,320):self.adapters['wake'].samples(i)
+  self.assertEqual(receive(self.s)[0],90)
+  time.sleep(.3);self.drain()
+  self.assertEqual(self.busbytes,bytearray(),'the continuous server-wake stream must not duck')
+  self.s.sendall(frame(92,num(1,10)))
+  self.assertTrue(self.feed_started(),'HA reporting the wake word must start the duck')
 if __name__=='__main__':unittest.main()

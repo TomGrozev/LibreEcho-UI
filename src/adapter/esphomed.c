@@ -120,7 +120,7 @@ struct state {
  int16_t ring[RING_SAMPLES];unsigned char mic_rx[24+2560];size_t mic_n;int mic_ack;
  /* Optional noise suppression on the speech sent to Home Assistant (#401), off unless web-config says voice_noise_suppression. It runs on every frame so the noise estimate is settled when a turn starts. */
  int noise_suppression;struct le_voice_ns ns;
- char conversation[128],tts_url[1024],next_url[1024],result[24];int continue_turn,run_end,early_tts,playing,announcement,pipeline,tts_done,timer_pending;
+ char conversation[128],tts_url[1024],next_url[1024],result[24];int duck,continue_turn,run_end,early_tts,playing,announcement,pipeline,tts_done,timer_pending;
  time_t result_time;struct esp_playback playback;int mdns_fd;
  char process_start[32],boot_id[64],listener_inode[32];unsigned listener_port;
  /* set_ring (#397): when its ledd overlay ends; 0 when none is running. */
@@ -320,7 +320,20 @@ static int announce_done(int success){unsigned char b[4];struct ep_writer w={b,s
 static void capture_end(void){if(S.turn==2&&S.owner>=0){unsigned char b[4];struct ep_writer w={b,sizeof b,0,0};ep_uint(&w,2,1);(void)send_writer(&S.clients[S.owner],106,&w);}if(S.turn==1||S.turn==2){S.turn=3;event_send(ACTIVITY_VOICE_KEY,"thinking");}profile("thinking");}
 /* Playback ends through turn_clear or the tick; report it once, when S.playing drops. */
 static void playback_stopped(void){if(!S.playing)return;S.playing=0;event_send(ACTIVITY_PLAYBACK_KEY,"stopped");}
-static void turn_clear(const char *result,int notify){int active=S.turn||S.playing,server=S.server_turn;if(notify)(void)announce_done(0);playback_stopped();esp_playback_close(&S.playback);S.playing=S.turn=S.continue_turn=S.run_end=S.early_tts=S.announcement=S.pipeline=S.tts_done=S.server_turn=0;S.next_url[0]=S.tts_url[0]=S.conversation[0]=0;snprintf(S.result,sizeof S.result,"%s",result);S.result_time=time(NULL);
+/* The audio engine publishes which of its buses carry audio in <bus root>/status.json
+ * (media covers radiod/Bluetooth media.pcm, AirPlay and Sendspin), so the satellite
+ * can duck only when there is music to duck. Absent or unreadable means no media.
+ * "media" also appears as the value of "active" ("active":"media"), so the flag must
+ * be read from inside the "buses" object: find_key would stop at that comma. */
+static int media_playing(void){char path[256],b[512],*buses;int v=0;const char *slash=strrchr(S.bus_path,'/');
+ if(!slash||(size_t)(slash-S.bus_path)+12>=sizeof path)return 0;
+ snprintf(path,sizeof path,"%.*s/status.json",(int)(slash-S.bus_path),S.bus_path);
+ if(config_read(path,b,sizeof b)<=0)return 0;
+ buses=strstr(b,"\"buses\"");
+ if(!buses||!(buses=strchr(buses,':'))||!(buses=strchr(buses,'{')))return 0;
+ return json_get_bool(buses,"media",&v)>0&&v;
+}
+static void turn_clear(const char *result,int notify){int active=S.turn||S.playing,server=S.server_turn;if(notify)(void)announce_done(0);playback_stopped();esp_playback_close(&S.playback);S.duck=0;S.playing=S.turn=S.continue_turn=S.run_end=S.early_tts=S.announcement=S.pipeline=S.tts_done=S.server_turn=0;S.next_url[0]=S.tts_url[0]=S.conversation[0]=0;snprintf(S.result,sizeof S.result,"%s",result);S.result_time=time(NULL);
  /* A server-wake stream ends by timeout or HA error; retry after a second so a rejected run cannot spin. */
  if(server)S.server_retry=S.now+1000;
  /* One voice event per opened turn (wake, announcement or continued turn). */
@@ -347,7 +360,7 @@ static int voice_start(uint64_t sample,int continued){unsigned char b[256];struc
     already detected here, so HA must start at STT -- with no HA wake engine the
     run otherwise fails instantly with wake-engine-missing. */
  ep_uint(&w,3,1);if(!continued)ep_string(&w,5,"Alexa");if(send_writer(&S.clients[S.owner],90,&w))return -1;
- S.capture_next=sample>3200?sample-3200:0;if(S.capture_next<S.ring_first)S.capture_next=S.ring_first;S.turn=1;S.turn_deadline=S.now+S.turn_limit;S.continue_turn=S.run_end=S.early_tts=S.tts_done=0;S.tts_url[0]=S.next_url[0]=0;S.announcement=0;S.pipeline=1;S.voice_open=1;if(!continued)event_send(ACTIVITY_VOICE_KEY,"wake_word");event_send(ACTIVITY_VOICE_KEY,"listening");profile("listening");wake_stop();status_write();return 0;
+ S.capture_next=sample>3200?sample-3200:0;if(S.capture_next<S.ring_first)S.capture_next=S.ring_first;S.turn=1;S.turn_deadline=S.now+S.turn_limit;S.continue_turn=S.run_end=S.early_tts=S.tts_done=0;S.tts_url[0]=S.next_url[0]=0;S.announcement=0;S.pipeline=1;S.voice_open=1;S.duck=media_playing();if(!continued)event_send(ACTIVITY_VOICE_KEY,"wake_word");event_send(ACTIVITY_VOICE_KEY,"listening");profile("listening");wake_stop();status_write();return 0;
 }
 /* Server-side wake (esphome_server_wake, off by default): open an ESPHome run with
  * USE_VAD|USE_WAKE_WORD and no phrase, then stream the mic continuously so Home
@@ -494,6 +507,8 @@ static void voice_event(const void *p,size_t n){unsigned event=(unsigned)ep_get_
  /* Speech text (#398): STT_END carries the transcript, TTS_START the reply text. Published only with the owner setting. */
  if(S.speech_text&&(event==4||event==7)){char t[TEXT_VALUE_MAX];if(event_data(p,n,"text",t,sizeof t)>0)text_set(event==4?TEXT_TRANSCRIPT_KEY:TEXT_REPLY_KEY,t);}
  if(event==0){cancel_turn("ha_error");return;}if(event==12)capture_end();
+ /* Server-side wake: HA's wake engine, not the continuous stream, starts the turn (WAKE_WORD_END). */
+ if(event==10)S.duck=media_playing();
  if(event==6){if(event_data(p,n,"conversation_id",S.conversation,sizeof S.conversation)<0){cancel_turn("bad_event");return;}if(event_data(p,n,"continue_conversation",v,sizeof v)<0){cancel_turn("bad_event");return;}S.continue_turn=!strcmp(v,"1");}
  if(event==100){if(event_data(p,n,"tts_start_streaming",v,sizeof v)<0){cancel_turn("bad_event");return;}S.early_tts=!strcmp(v,"1");}
  if((event==100&&S.early_tts)||event==8){capture_end();if(!S.playing&&!S.tts_done&&S.tts_url[0]){event_send(ACTIVITY_VOICE_KEY,"replying");if(playback_start(S.tts_url)<0){(void)announce_done(0);cancel_turn("playback_error");return;}}}
@@ -744,8 +759,10 @@ int main(int argc,char **argv){const char *bind_addr="0.0.0.0";unsigned port=605
  /* next_url is set only while a preannounce plays: the announcement follows whether the chime finished or failed. */
  if(S.playing){int rc=esp_playback_tick(&S.playback,S.now);if(rc){playback_stopped();if(S.next_url[0]){char next[1024];snprintf(next,sizeof next,"%s",S.next_url);S.next_url[0]=0;if(playback_start(next)<0)turn_clear("playback_error",1);}else if(rc<0)turn_clear("playback_error",1);else completed();}}
  /* Thinking: the reply is coming, so power the speaker output up now (about
-  * 1.2 s) behind STT and the LLM instead of after the reply's first byte. */
- if(S.turn==3&&!S.playing)esp_playback_warm(&S.playback,S.bus_path,S.now);
+  * 1.2 s) behind STT and the LLM instead of after the reply's first byte.
+  * A turn that started while music played keeps the system bus fed for its
+  * whole length, so the engine ducks media from wake through the reply. */
+ if(!S.playing&&(S.turn==3||S.duck))esp_playback_warm(&S.playback,S.bus_path,S.now);
  mdns_tick(port);
  }
  S.ready=0;for(unsigned i=0;i<CLIENTS;i++)client_close(i);
