@@ -316,9 +316,10 @@ int le_wake_model_select(const struct le_wake_model_paths *paths, const char *na
 
 int le_wake_model_delete(const struct le_wake_model_paths *paths, const char *name)
 {
-    char folder[400], file[480], selected[LE_WAKE_MODEL_NAME_MAX];
+    char folder[400], file[700], selected[LE_WAKE_MODEL_NAME_MAX];
     struct stat st;
-    size_t i;
+    DIR *dir;
+    struct dirent *entry;
 
     if (!paths || !name || !le_wake_model_name_valid(name) || reserved_name(name))
         return LE_WAKE_MODEL_STORE_INVALID;
@@ -329,11 +330,22 @@ int le_wake_model_delete(const struct le_wake_model_paths *paths, const char *na
         return LE_WAKE_MODEL_STORE_INVALID;
     if (lstat(folder, &st) < 0 || !S_ISDIR(st.st_mode))
         return LE_WAKE_MODEL_STORE_NOT_FOUND;
-    for (i = 0; i < LE_WAKE_MODEL_FILE_COUNT; ++i) {
-        if (model_file_path(file, sizeof(file), folder, name, (int)i) > 0 &&
-            unlink(file) < 0 && errno != ENOENT)
+    /* Every entry, not just the staged pair: folders left by the openWakeWord
+     * releases hold .onnx files, and rmdir needs the folder empty. */
+    dir = opendir(folder);
+    if (!dir)
+        return LE_WAKE_MODEL_STORE_IO;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        if (snprintf(file, sizeof(file), "%s/%s", folder, entry->d_name) >=
+                (int)sizeof(file) ||
+            (unlink(file) < 0 && errno != ENOENT)) {
+            closedir(dir);
             return LE_WAKE_MODEL_STORE_IO;
+        }
     }
+    closedir(dir);
     return rmdir(folder) < 0 ? LE_WAKE_MODEL_STORE_IO : LE_WAKE_MODEL_STORE_OK;
 }
 

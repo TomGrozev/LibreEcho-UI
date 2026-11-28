@@ -748,7 +748,7 @@ int le_wake_model_validate_directory(const char *directory, char *reason, size_t
     struct stat st;
     DIR *dir;
     struct dirent *entry;
-    int found = 0, unexpected = 0;
+    int found = 0, unexpected = 0, legacy = 0;
 
     if (!directory)
         return fail(reason, reason_size, "model directory is missing");
@@ -766,12 +766,21 @@ int le_wake_model_validate_directory(const char *directory, char *reason, size_t
     while ((entry = readdir(dir)) != NULL) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
             continue;
-        if (strcmp(entry->d_name, manifest_name) && strcmp(entry->d_name, tflite_name))
+        if (strcmp(entry->d_name, manifest_name) && strcmp(entry->d_name, tflite_name)) {
+            size_t length = strlen(entry->d_name);
+
             unexpected = 1;
-        else
+            if (length > 5 && !strcmp(entry->d_name + length - 5, ".onnx"))
+                legacy = 1;
+        } else {
             ++found;
+        }
     }
     closedir(dir);
+    if (legacy)
+        return fail(reason, reason_size,
+                    "openWakeWord model from an earlier release; wake words now use "
+                    "microWakeWord, so delete it");
     if (unexpected)
         return fail(reason, reason_size, "model folder holds an unexpected file");
     if (found != LE_WAKE_MODEL_FILE_COUNT)

@@ -538,6 +538,12 @@ static void check_directory(void)
     write_file(extra, (const unsigned char *)"x", 1);
     CHECK(le_wake_model_validate_directory(dir, reason, sizeof(reason)) < 0);
     CHECK(strstr(reason, "unexpected file") != NULL);
+
+    /* A folder from the openWakeWord releases is named as such. */
+    path_in(extra, sizeof(extra), dir, "alexa_v0.1.onnx");
+    write_file(extra, (const unsigned char *)"x", 1);
+    CHECK(le_wake_model_validate_directory(dir, reason, sizeof(reason)) < 0);
+    CHECK(strstr(reason, "openWakeWord") != NULL);
 }
 
 /* ---- store ---- */
@@ -666,6 +672,23 @@ static void check_store(void)
 
     CHECK(le_wake_model_delete(&paths, "my-word") == LE_WAKE_MODEL_STORE_OK);
     CHECK(le_wake_model_delete(&paths, "my-word") == LE_WAKE_MODEL_STORE_NOT_FOUND);
+
+    /* An openWakeWord folder holds files other than the staged pair; delete
+     * still removes it. */
+    {
+        char legacy[700], file[800];
+
+        path_in(legacy, sizeof(legacy), paths.models, "old_alexa");
+        mkdir(legacy, 0700);
+        path_in(file, sizeof(file), legacy, "melspectrogram.onnx");
+        write_file(file, (const unsigned char *)"x", 1);
+        path_in(file, sizeof(file), legacy, "alexa_v0.1.onnx");
+        write_file(file, (const unsigned char *)"x", 1);
+        memset(&t, 0, sizeof(t));
+        CHECK(le_wake_model_scan(&paths, tally_visit, &t) == 1);
+        CHECK(t.valid == 0);
+        CHECK(le_wake_model_delete(&paths, "old_alexa") == LE_WAKE_MODEL_STORE_OK);
+    }
     memset(&t, 0, sizeof(t));
     CHECK(le_wake_model_scan(&paths, tally_visit, &t) == 0);
 }

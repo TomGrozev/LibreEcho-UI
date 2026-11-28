@@ -2799,8 +2799,10 @@ one subgraph, the input and output tensor types and shapes, the allowed
 operators, and the absence of a custom operator. A folder that fails is
 discarded and the `422` response says why.
 
-`DELETE /api/v1/wake-word/models/{name}` removes a folder. The selected folder
-cannot be removed (`409`); select the stock model first.
+`DELETE /api/v1/wake-word/models/{name}` removes a folder and every file in it.
+The selected folder cannot be removed (`409`); select the stock model first.
+Folders left by the openWakeWord releases hold `.onnx` files; the listing marks
+them invalid with a reason naming openWakeWord, and this call removes them.
 
 The wake status reports the loaded model: `wake_word` is `Alexa` for the stock
 model and the manifest's `wake_word` (or a prettified folder name) for an
